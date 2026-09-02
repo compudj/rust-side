@@ -283,23 +283,39 @@ mod lifecycle {
 
 The address cannot be written at build time -- the const evaluator
 refuses to turn a pointer into an integer, whatever it points at -- so
-the group's constructor writes it before registering. That is the work a
-loader does for a relocation, and it costs the same: one store, dirtying
-the one page the relocation would have dirtied.
+the bytes are laid out with a *hole* where each address belongs, and the
+object built around them names a pointer at every hole:
+
+```rust
+#[repr(C, packed)]
+struct GroupDesc {
+    run_0: [u8; RUN_0],
+    ptr_0: SideRawPtr,      // a pointer written as a pointer
+    run_1: [u8; RUN_1],
+    ...
+}
+```
+
+A pointer written as a pointer is a relocation. The loader fills it in
+before anything of the program runs, and -- what the group's own
+constructor writing the address could never give -- a reader of the
+*file* can follow it, so `readside` walks into the fields of a structure
+described elsewhere.
 
 **Which is why it is worth measuring before reaching for it.** Two
 groups of twenty events over the same structure:
 
-| | description | pages dirtied |
+| | description | pages private |
 |---|---|---|
-| `side_extern(PROCESS_INFO)` | 10240 bytes | 3 of 3 |
-| each group describing it | 11056 bytes | 0 of 3 |
+| `side_extern(PROCESS_INFO)` | 10226 bytes, 40 relocations | 3 of 3 |
+| each group describing it | 11032 bytes, no relocation | 2 of 4 |
 
-816 bytes saved, and every page of the descriptions private to the
-process instead of shared between them. Within one group it is worse
-still: the group already shares a structure two of its events describe
-the same way, so `side_extern()` there buys nothing at all and only
-costs the pages.
+806 bytes saved, and every page of the descriptions private to the
+process instead of shared between them. (The two on the duplicating side
+are its neighbours in the section's end pages, not the descriptions.)
+Within one group it is worse still: the group already shares a structure
+two of its events describe the same way, so `side_extern()` there buys
+nothing at all and only costs the pages.
 
 Reach for it for the two things duplication cannot do:
 
@@ -341,8 +357,10 @@ side_event_state         size     64  relocations 4
 The two relocations an event does cost are in `side_event_state`, a
 section a tracer writes to anyway when it enables the event, and one
 more in `side_event_state_ptr`, which is how an event is reached. The
-description itself costs none. This holds under `--release`, under fat
-LTO and under `--gc-sections`.
+description itself costs none, unless it names a structure described
+elsewhere: `side_extern()` is one relocation per reference, and buys
+what is said above. This holds under `--release`, under fat LTO and
+under `--gc-sections`.
 
 One consequence is worth knowing when reading the code: a type
 description is no longer something to write once and point at from

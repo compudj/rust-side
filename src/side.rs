@@ -731,8 +731,11 @@ pub enum Layout {
      * A structure described in another object: another group of events,
      * or another crate. Its description cannot be reached by a distance
      * -- a distance is between two bytes of one object -- so the
-     * reference holds its address, and `target' says which address, by
-     * position in the table the group carries. See `Patch'.
+     * reference holds its address, which is left as a hole for the
+     * loader to fill; see `Patch'. `target' names which structure, by
+     * position in the list of those a group refers to, and is here so
+     * that two references which describe the same way but name
+     * different structures are not taken for one.
      */
     ExternStruct {
         offset: u64,
@@ -742,22 +745,38 @@ pub enum Layout {
     },
 }
 
-/// Where a foreign address goes, and which one.
+/// Where a foreign address goes.
 ///
 /// The const evaluator refuses to turn a pointer into an integer, so an
 /// address cannot be written into the bytes of a description at build
-/// time, whatever it points at. What is written instead is nothing --
-/// the selector byte says the reference holds an address, and the
-/// address is left zero -- and the event's constructor fills it in
-/// before registering, which is the work a loader does for a relocation
-/// and costs the same: one store, dirtying the one page the relocation
-/// would have dirtied.
+/// time, whatever it points at. The bytes are therefore laid out with a
+/// hole where each one belongs, and what the description is made of is
+/// the runs between the holes and a pointer at each: a pointer written
+/// as a pointer, which is a relocation, which the loader fills in and
+/// which a reader of the file can follow.
+///
+/// The holes come out in the order they are laid out, each one
+/// `SideRawPtr` wide, which is what `description_run()` and the object
+/// a call site builds around them rely on.
 #[derive(Clone, Copy)]
 pub struct Patch {
-    /// The byte of the description holding the address.
+    /// The byte of the description where the address belongs.
     pub at: usize,
-    /// Which address, by position in the group's table.
-    pub target: usize,
+}
+
+/// How wide a hole is: what an address occupies in a selector pointer.
+pub const PATCH_WIDTH: usize = size_of::<SideRawPtr>();
+
+/// The bytes of a description from `from`, which is the run between two
+/// holes, or before the first, or after the last.
+pub const fn description_run<const N: usize>(bytes: &[u8], from: usize) -> [u8; N] {
+    let mut run = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        run[i] = bytes[from + i];
+        i += 1;
+    }
+    run
 }
 
 /// What the const evaluator builds: the bytes, and the `K` addresses
@@ -775,18 +794,29 @@ struct Patches<const K: usize> {
 impl<const K: usize> Patches<K> {
     const fn new() -> Self {
         Self {
-            at: [Patch { at: 0, target: 0 }; K],
+            at: [Patch { at: 0 }; K],
             len: 0,
         }
     }
 }
 
-const fn patch<const K: usize>(patches: &mut Patches<K>, at: usize, target: usize) {
+const fn patch<const K: usize>(patches: &mut Patches<K>, at: usize) {
     assert!(
         patches.len < K,
         "side: more references to a structure described elsewhere than were counted"
     );
-    patches.at[patches.len] = Patch { at, target };
+    /*
+     * In order, and never overlapping: the runs between them are what
+     * the description is cut into, and a call site names one pointer
+     * per hole in the order the fields which need them were written.
+     */
+    if patches.len > 0 {
+        assert!(
+            patches.at[patches.len - 1].at + PATCH_WIDTH <= at,
+            "side: the addresses of a description are not laid out in order"
+        );
+    }
+    patches.at[patches.len] = Patch { at };
     patches.len += 1;
 }
 
@@ -1650,7 +1680,8 @@ const fn put_type<const K: usize>(
             offset,
             size,
             access,
-            target,
+            /* Which structure is the loader's business, not ours. */
+            target: _,
         } => {
             /*
              * A structure keeps its attributes with its definition, as
@@ -1666,10 +1697,11 @@ const fn put_type<const K: usize>(
             put_u32(buf, u + O_GSTRUCT_SIZE, size);
             /*
              * The selector byte is already zero, which says the
-             * reference holds an address; the address itself is left
-             * for the constructor. See `Patch'.
+             * reference holds an address, and the address itself is a
+             * hole the object built around these bytes fills with a
+             * pointer. See `Patch'.
              */
-            patch(patches, u + O_GSTRUCT_TYPE, target);
+            patch(patches, u + O_GSTRUCT_TYPE);
         }
     }
 

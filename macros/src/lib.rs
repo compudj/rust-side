@@ -644,24 +644,22 @@ fn group_body(events: &[Event]) -> String {
     }
 
     let count = events.len();
-    let ntargets = targets.len();
+
     /*
-     * One address is written per reference, not per structure: two
-     * fields naming the same one are two places to write it.
+     * One hole per reference to a structure described elsewhere, in the
+     * order the fields needing them were written, which is the order
+     * the builder lays them out in and asserts they come out in.
      */
-    let ntargets_refs = events
+    let uses = events
         .iter()
         .flat_map(|event| &event.fields)
-        .filter(|field| matches!(field.kind, FieldKind::Extern(_)))
-        .count();
-    let target_table = targets
-        .iter()
-        .map(|path| {
-            format!(
-                "::libside::side::SideRawPtr::from_ptr(unsafe {{ ::core::ptr::addr_of_mut!({path}::DESC) }}.cast()),"
-            )
+        .filter_map(|field| match &field.kind {
+            FieldKind::Extern(path) => Some(path.clone()),
+            FieldKind::Rust(_) => None,
         })
-        .collect::<String>();
+        .collect::<Vec<_>>();
+    let nuses = uses.len();
+    let (holes, desc_fields, desc_init) = description_object(&uses);
 
     format!(
         r#"
@@ -675,29 +673,39 @@ fn group_body(events: &[Event]) -> String {
             pub const SPECS: &[::libside::side::EventSpec] = &[{specs}];
             pub const SIZE: usize = ::libside::side::group_size(SPECS);
 
-            /* One address per reference to a structure described elsewhere. */
-            pub const NR_PATCHES: usize = {ntargets_refs};
+            /* One hole per reference to a structure described elsewhere. */
+            pub const NR_PATCHES: usize = {nuses};
 
             const BUILT: ::libside::side::Built<SIZE, NR_PATCHES> =
                 ::libside::side::build_group::<SIZE, NR_PATCHES>(SPECS);
 
+            {holes}
+
             /*
              * Every description of the group in one object, sharing one
              * copy of each type they describe the same way.
+             *
+             * The bytes the const evaluator laid out, cut at every
+             * address it could not write, with a pointer in its place:
+             * written as a pointer it is a relocation, which the loader
+             * fills in and which a reader of the file can follow.
+             * Packed, so that nothing is inserted between the two.
              */
-            #[repr(C, align(16))]
-            pub struct GroupDesc(pub [u8; SIZE]);
+            #[repr(C, packed)]
+            pub struct GroupDesc {{
+                {desc_fields}
+            }}
+
+            const _: () = assert!(
+                ::core::mem::size_of::<GroupDesc>() == SIZE,
+                "side: the description object is not the size of the description"
+            );
 
             #[used]
             #[cfg_attr(any(target_os = "linux", target_os = "android"), link_section = "side_event_description")]
-            pub static mut DESC: GroupDesc = GroupDesc(BUILT.bytes);
-
-            /*
-             * The structures described elsewhere, and where in the
-             * descriptions their addresses go. See side::Patch.
-             */
-            static TARGETS: [::libside::side::SideRawPtr; {ntargets}] = [{target_table}];
-            const PATCHES: [::libside::side::Patch; NR_PATCHES] = BUILT.patches;
+            pub static mut DESC: GroupDesc = GroupDesc {{
+                {desc_init}
+            }};
 
             {states}
 
@@ -710,21 +718,6 @@ fn group_body(events: &[Event]) -> String {
 
             unsafe extern "C" fn register() {{
                 unsafe {{
-                    /*
-                     * Write the address of each structure described
-                     * elsewhere, which is the work a loader does for a
-                     * relocation and costs the same.
-                     */
-                    let base = ::core::ptr::addr_of_mut!(DESC).cast::<u8>();
-                    let mut i = 0;
-                    while i < NR_PATCHES {{
-                        let patch = PATCHES[i];
-                        base.add(patch.at)
-                            .cast::<::libside::side::SideRawPtr>()
-                            .write_unaligned(TARGETS[patch.target]);
-                        i += 1;
-                    }}
-
                     HANDLE = ::libside::side::side_events_register(
                         ::core::ptr::addr_of_mut!(STATE_PTRS).cast(), {count});
                 }}
@@ -746,6 +739,61 @@ fn group_body(events: &[Event]) -> String {
         {calls}
 "#
     )
+}
+
+/// The description as an object: the runs of bytes the const evaluator
+/// laid out, and a pointer at each hole it left.
+///
+/// Returns what to declare before the object, what it holds, and how it
+/// is built. A group with no reference to a structure described
+/// elsewhere is one run and nothing else.
+fn description_object(uses: &[String]) -> (String, String, String) {
+    let mut holes = String::new();
+    let mut fields = String::new();
+    let mut init = String::new();
+
+    for (i, path) in uses.iter().enumerate() {
+        holes.push_str(&format!("const HOLE_{i}: usize = BUILT.patches[{i}].at;\n"));
+        if i == 0 {
+            holes.push_str("const RUN_0: usize = HOLE_0;\n");
+            init.push_str(
+                "run_0: ::libside::side::description_run::<RUN_0>(&BUILT.bytes, 0),",
+            );
+        } else {
+            holes.push_str(&format!(
+                "const RUN_{i}: usize = HOLE_{i} - HOLE_{p} - ::libside::side::PATCH_WIDTH;\n",
+                p = i - 1
+            ));
+            init.push_str(&format!(
+                "run_{i}: ::libside::side::description_run::<RUN_{i}>(&BUILT.bytes, HOLE_{p} + ::libside::side::PATCH_WIDTH),",
+                p = i - 1
+            ));
+        }
+        fields.push_str(&format!(
+            "run_{i}: [u8; RUN_{i}], ptr_{i}: ::libside::side::SideRawPtr,"
+        ));
+        init.push_str(&format!(
+            "ptr_{i}: ::libside::side::SideRawPtr::from_ptr(unsafe {{ ::core::ptr::addr_of_mut!({path}::DESC) }}.cast()),"
+        ));
+    }
+
+    let last = uses.len();
+    if last == 0 {
+        holes.push_str("const RUN_0: usize = SIZE;\n");
+        init.push_str("run_0: ::libside::side::description_run::<RUN_0>(&BUILT.bytes, 0),");
+    } else {
+        holes.push_str(&format!(
+            "const RUN_{last}: usize = SIZE - HOLE_{p} - ::libside::side::PATCH_WIDTH;\n",
+            p = last - 1
+        ));
+        init.push_str(&format!(
+            "run_{last}: ::libside::side::description_run::<RUN_{last}>(&BUILT.bytes, HOLE_{p} + ::libside::side::PATCH_WIDTH),",
+            p = last - 1
+        ));
+    }
+    fields.push_str(&format!("run_{last}: [u8; RUN_{last}],"));
+
+    (holes, fields, init)
 }
 
 /// The nest of closures which keeps every argument alive until the call.
