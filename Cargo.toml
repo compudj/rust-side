@@ -2,6 +2,7 @@
 name = "libside-rust"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.83"
 links = "side"
 build = "build.rs"
 
