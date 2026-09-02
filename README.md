@@ -119,7 +119,8 @@ The events are written exactly as they are on their own; the module is
 the only new thing. `examples/provider.rs` is three events sharing two
 structures: **2640 bytes of description ungrouped, 1552 grouped**, the
 same behaviour and no relocation either way.
-`tests/benchmark/description-sharing` weighs it at a thousand. What is shared is the
+`tests/benchmark/description-sharing` weighs it at a thousand, and
+`tests/benchmark/event-cost` weighs what an event costs to emit. What is shared is the
 description of a structure, which is the same bytes wherever it is used;
 the 64 byte type at each point of use still carries its own offset and
 access mode, exactly as `side_static_define_struct` and

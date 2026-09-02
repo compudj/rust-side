@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+
+"""
+What one event costs when it is emitted from Rust, next to what the same
+event costs through libside's C API.
+
+The event carries a single 32-bit integer, which is the smallest payload
+that still has to be described, filtered and serialized, and the loop
+around it is the same in all three programs. What is left between the
+columns is what each frontend puts between the call site and
+side_call(): a macro for the C API and for a Rust event declared on its
+own, a function for one in a group.
+
+Four cases per program:
+
+  disabled       no session at all: the event has no subscriber
+  enabled        recorded into the ring buffer, no filter
+  filter-const   a filter which is false without reading the payload
+  filter-field   a filter which reads the payload and rejects every
+                 instance
+
+The sub-buffers are the default ones of a snapshot session, which are
+overwrite buffers, so nothing is written to disk while the loop runs.
+
+The programs are interleaved rather than run one after another: for each
+case, one repetition of each program in turn, over and over. A machine
+which drifts -- and one which scales its frequency always does -- moves
+every column of a repetition together, which leaves the comparison
+between them standing. Running all the repetitions of one program before
+the next puts the drift between the columns instead, where it is
+indistinguishable from what is being measured.
+
+Before timing anything, each traced case is run once with a small count
+into a session which does write to disk, and the events which came out
+are counted. A silently disabled event measures as a very fast disabled
+path, and that is the only way to tell the two apart.
+
+A session daemon must be running. Nothing outside a temporary session is
+touched: the session is destroyed on the way out.
+"""
+
+import argparse
+import os
+import pathlib
+import statistics
+import subprocess
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+CPU = os.environ.get("BENCH_CPU", "3")
+ITERS = int(os.environ.get("BENCH_ITERS", "5000000"))
+WARMUP = int(os.environ.get("BENCH_WARMUP", "1000000"))
+REPS = int(os.environ.get("BENCH_REPS", "7"))
+VERIFY_ITERS = int(os.environ.get("BENCH_VERIFY_ITERS", "2000"))
+
+EVENT = "side_benchmark:u32"
+
+# The loop emits v = 0, 1, 2, ..., so this value is never reached and
+# every instance is rejected.
+FILTERS = {
+    "filter-const": "1 == 0",
+    "filter-field": "v == 4000000000",
+}
+MODES = ("disabled", "enabled", "filter-const", "filter-field")
+
+# The C API comes first: it is what the Rust frontends are measured
+# against.
+CASES = [
+    ("C", "bench-side"),
+    ("Rust macro", "rust/target/release/bench-macro"),
+    ("Rust group", "rust/target/release/bench-group"),
+]
+
+LABELS = {
+    "disabled": "disabled (no session)",
+    "enabled": "recorded to ring buffer",
+    "filter-const": 'filter "1 == 0"',
+    "filter-field": "filter on the payload field",
+}
+
+
+def sh(args, check=True):
+    return subprocess.run(args, check=check, capture_output=True, text=True)
+
+
+def pkg_config(*args):
+    try:
+        return sh(["pkg-config", *args]).stdout.split()
+    except subprocess.CalledProcessError:
+        return []
+
+
+def library_dirs(*packages):
+    return [t[2:] for t in pkg_config("--libs-only-L", *packages) if t.startswith("-L")]
+
+
+def find_library(stem, packages, env):
+    if os.environ.get(env):
+        return os.environ[env]
+    for directory in library_dirs(*packages):
+        for candidate in sorted(pathlib.Path(directory).glob(stem)):
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def build(ust_lib):
+    side_flags = pkg_config("--cflags", "--libs", "libside")
+    if not side_flags:
+        sys.exit("libside was not found by pkg-config")
+    rpath = [f"-Wl,-rpath,{d}" for d in library_dirs("libside")]
+    subprocess.run(
+        ["gcc", "-O2", "-g", "-Wall", "-o", str(HERE / "bench-side"),
+         str(HERE / "bench-side.c"), *side_flags, *rpath],
+        check=True,
+    )
+    subprocess.run(["cargo", "build", "--release"], cwd=HERE / "rust", check=True)
+    if not ust_lib:
+        sys.exit("liblttng-ust was not found by pkg-config; set UST_LIB")
+
+
+def run_app(binary, ust_lib, side_dirs, iters, warmup, reps):
+    path = HERE / binary
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = ust_lib
+    env["LD_LIBRARY_PATH"] = ":".join(
+        side_dirs + ([env["LD_LIBRARY_PATH"]] if "LD_LIBRARY_PATH" in env else [])
+    )
+    r = subprocess.run(
+        ["taskset", "-c", CPU, str(path), str(iters), str(warmup), str(reps)],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    return [float(line) for line in r.stdout.split() if line]
+
+
+def session(name, filter_expr, snapshot):
+    sh(["lttng", "destroy", name], check=False)
+    args = ["lttng", "-q", "create", name]
+    if snapshot:
+        args.append("--snapshot")
+    sh(args)
+    enable = ["lttng", "-q", "enable-event", "--userspace", EVENT]
+    if filter_expr:
+        enable += ["--filter", filter_expr]
+    sh(enable)
+    sh(["lttng", "-q", "start"])
+
+
+def measure(ust_lib, side_dirs, filter_expr):
+    """
+    One figure per repetition for every program, taken a repetition at a
+    time so that they share whatever the machine was doing. filter_expr
+    False runs with no session.
+    """
+    name = f"bench-rust-{os.getpid()}"
+    traced = filter_expr is not False
+    values = {case: [] for case, _ in CASES}
+
+    if traced:
+        session(name, filter_expr, snapshot=True)
+    try:
+        for _ in range(REPS):
+            for case, binary in CASES:
+                values[case] += run_app(
+                    binary, ust_lib, side_dirs, ITERS, WARMUP, 1)
+    finally:
+        if traced:
+            sh(["lttng", "-q", "stop"], check=False)
+            sh(["lttng", "destroy", name], check=False)
+    return values
+
+
+def recorded(binary, ust_lib, side_dirs, filter_expr):
+    """How many events a short run actually wrote, which is the check."""
+    name = f"bench-rust-verify-{os.getpid()}"
+    session(name, filter_expr, snapshot=False)
+    try:
+        run_app(binary, ust_lib, side_dirs, VERIFY_ITERS, 0, 1)
+        sh(["lttng", "-q", "stop"], check=False)
+        out = sh(["lttng", "view", name], check=False).stdout
+        return sum(1 for line in out.splitlines() if EVENT in line)
+    finally:
+        sh(["lttng", "destroy", name], check=False)
+
+
+def verify(ust_lib, side_dirs):
+    print("Verifying that each case records what it should")
+    ok = True
+    for name, binary in CASES:
+        for mode in ("enabled", "filter-const", "filter-field"):
+            want = VERIFY_ITERS if mode == "enabled" else 0
+            got = recorded(binary, ust_lib, side_dirs, FILTERS.get(mode))
+            state = "ok" if got == want else "WRONG"
+            if got != want:
+                ok = False
+            print(f"  {name:<12} {mode:<14} {got:>8} of {want:<8} {state}")
+    print()
+    if not ok:
+        sys.exit("a case did not record what it should: the numbers would mean nothing")
+
+
+def cell(values):
+    return f"{statistics.median(values):6.2f} [{min(values):5.2f}-{max(values):5.2f}]"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    p.add_argument("--no-verify", action="store_true",
+                   help="skip the check that each case records what it should")
+    p.add_argument("--no-build", action="store_true", help="use what is already built")
+    args = p.parse_args()
+
+    ust_lib = find_library("liblttng-ust.so*", ["lttng-ust"], "UST_LIB")
+    side_dirs = library_dirs("libside")
+
+    if not args.no_build:
+        build(ust_lib)
+
+    print(f"iterations={ITERS} warmup={WARMUP} reps={REPS} cpu={CPU}")
+    print(f"tracer: {ust_lib}")
+    print()
+
+    if not args.no_verify:
+        verify(ust_lib, side_dirs)
+
+    results = {}
+    for mode in MODES:
+        expr = {"disabled": False, "enabled": None}.get(mode, FILTERS.get(mode))
+        for name, values in measure(ust_lib, side_dirs, expr).items():
+            results[(name, mode)] = values
+
+    width = 22
+    print(f"{'case':<28}" + "".join(f"{n:<{width}}" for n, _ in CASES))
+    print(f"{'':<28}" + "".join(f"{'median [min - max]':<{width}}" for _ in CASES))
+    print("-" * (28 + width * len(CASES)))
+    for mode in MODES:
+        row = f"{LABELS[mode]:<28}"
+        for name, _ in CASES:
+            row += f"{cell(results[(name, mode)]):<{width}}"
+        print(row)
+    print()
+
+    base = CASES[0][0]
+    print(f"{'against ' + base:<28}" + "".join(
+        f"{n:<{width}}" for n, _ in CASES[1:]))
+    print("-" * (28 + width * (len(CASES) - 1)))
+    for mode in MODES:
+        row = f"{LABELS[mode]:<28}"
+        b = statistics.median(results[(base, mode)])
+        for name, _ in CASES[1:]:
+            m = statistics.median(results[(name, mode)])
+            row += f"{m - b:>+7.2f}  {m / b:>5.2f}x       "
+        print(row)
+    print()
+    print("nanoseconds per event")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+# A crate of its own, depending on the one it measures by path, so that
+# building that crate never builds these.
+[package]
+name = "event-cost"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+libside-rust = { path = "../../../.." }
+
+[profile.release]
+debug = true
