@@ -112,7 +112,7 @@ mod trace {
     );
 }
 
-trace::process_started(0, &process);
+side_event!(trace::process_started, 0, &process);
 ```
 
 The events are written exactly as they are on their own; the module is
@@ -130,20 +130,28 @@ Two structures which describe the same way *are* the same description,
 so what is compared is the shape rather than which Rust type it came
 from. Merging them is right, not a coincidence to be avoided.
 
-A group calls the events as functions rather than through a macro, and
-registers all of them with one call:
+All the events of a group register with one call, and each becomes a
+module of its own name holding `enabled()` and `emit()`:
 
 ```rust
-trace::process_started(0, &process);            // asks whether it is enabled first
+side_event!(trace::process_started, 0, &process);
 
-if trace::thread_switched_enabled() {           // only where the arguments cost something
-    trace::thread_switched(&expensive(), &other());
+if trace::process_started::enabled() {      // where the answer is wanted
+    ...                                     // for something else too
 }
 ```
 
-That mirrors `tracepoint()` and `tracepoint_enabled()`. A standalone
-`define_event!` keeps its macro and its named arguments; grouping is
-additive, and nothing changes for an event which does not want it.
+`side_event!()` asks whether the event is enabled before it works out
+the arguments, so one which costs something, or has an effect of its
+own, is not reached at all while nothing is listening -- which is what
+`tracepoint()` and `side_event()` are macros for. It is one macro for
+every event rather than one per event: the path is written at the call
+site and resolves there, which is what lets it name neither the module
+the event lives in nor the crate.
+
+A standalone `define_event!` keeps its own macro and its named
+arguments; grouping is additive, and nothing changes for an event which
+does not want it.
 
 ## Crossing a group: `define_type!` and `side_extern()`
 

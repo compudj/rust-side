@@ -4,6 +4,9 @@
 //! structure two of them describe the same way is described once. That
 //! is the boundary a translation unit gives the C API, and the one a
 //! tracepoint provider has always had.
+//!
+//! Each event becomes a module of its own name holding `enabled()` and
+//! `emit()`, which `side_event!()` reaches by the path it is given.
 
 use libside::*;
 
@@ -73,14 +76,12 @@ fn main() {
         threads: [thread(1), thread(2), thread(3), thread(4)],
     };
 
-    trace::process_started(0, &process);
-    trace::process_exited(0, &process);
-
     /*
-     * Ask first only where working out the arguments costs something:
-     * the event itself asks before it reads any of them.
+     * side_event!() asks whether the event is enabled before it works
+     * out the arguments, so one which costs something, or has an effect
+     * of its own, is not reached at all while nothing is listening.
      */
-    if trace::thread_switched_enabled() {
-        trace::thread_switched(&thread(1), &thread(2));
-    }
+    side_event!(trace::process_started, 0, &process);
+    side_event!(trace::process_exited, 0, &process);
+    side_event!(trace::thread_switched, &thread(1), &thread(2));
 }

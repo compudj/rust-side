@@ -16,13 +16,15 @@ between the call site and `side_call()`.
 |---|---|---|
 | `bench-side.c` | `side_static_event()` | a macro |
 | `bench-macro` | `define_event!` | a macro |
-| `bench-group` | `define_event!` in `#[libside::events]` | a function |
+| `bench-group` | `define_event!` in `#[libside::events]` | `side_event!` |
 
-The two Rust programs are there because grouping changes the call site:
-an event on its own gets a macro which tests whether it is enabled where
-it is written, and one in a group gets a function which tests inside
-itself. Both are `#[inline(always)]`, and the question is whether that
-is enough.
+The two Rust programs are there because grouping changes what the call
+site expands to. An event on its own gets a macro of its own; one in a
+group is reached through `side_event!`, the single macro which serves
+every event, and lands on two functions -- `enabled()` and `emit()` --
+rather than on one. Both ask before they work out the arguments, and
+everything is `#[inline(always)]`; the question is whether that is
+enough.
 
 None of them links the tracer. `run-benchmark` preloads it, which is how
 libside instrumentation is used.

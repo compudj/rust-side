@@ -33,7 +33,7 @@ mod trace {
 #[inline(never)]
 fn emit(nr: u64) {
     for i in 0..nr {
-        trace::bench_event(i as u32);
+        side_event!(trace::bench_event, i as u32);
     }
 }
 

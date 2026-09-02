@@ -549,28 +549,43 @@ fn group_body(events: &[Event]) -> String {
         let name = &event.name;
         calls.push_str(&format!(
             r#"
-        /// Whether a tracer is listening for this event.
+        /// The two halves of this event, which `side_event!()` reaches
+        /// by the path it is given: whether anything is listening, and
+        /// the emission itself.
         ///
-        /// Only worth asking where working out the arguments costs
-        /// something: the event itself asks before it reads any of them.
-        #[inline(always)]
-        pub fn {name}_enabled() -> bool {{
-            unsafe {{
-                let enabled = ::core::ptr::addr_of!(
-                    (*::core::ptr::addr_of_mut!(__side::STATE_{i})).enabled);
-                ::core::ptr::read_volatile(enabled) != 0
-            }}
-        }}
+        /// They are apart so that asking can come first, which is what
+        /// lets a call site skip working out arguments nothing would
+        /// read. Emit it with
+        ///
+        /// ```ignore
+        /// side_event!(path::to::{name}, ...);
+        /// ```
+        ///
+        /// or, where the answer is wanted for something else, ask with
+        /// `enabled()` and emit with `emit()`.
+        #[allow(non_snake_case)]
+        pub mod {name} {{
+            use super::*;
 
-        #[inline(always)]
-        pub fn {name}({signature}) {{
-            if !{name}_enabled() {{
-                return;
+            /// Whether a tracer is listening for this event.
+            #[inline(always)]
+            pub fn enabled() -> bool {{
+                unsafe {{
+                    let enabled = ::core::ptr::addr_of!(
+                        (*::core::ptr::addr_of_mut!(__side::STATE_{i})).enabled);
+                    ::core::ptr::read_volatile(enabled) != 0
+                }}
             }}
-            let state = unsafe {{
-                ::core::ptr::addr_of!((*::core::ptr::addr_of_mut!(__side::STATE_{i})).parent)
-            }};
-            {}
+
+            /// Emit it, without asking again.
+            #[inline(always)]
+            pub fn emit({signature}) {{
+                let state = unsafe {{
+                    ::core::ptr::addr_of!(
+                        (*::core::ptr::addr_of_mut!(__side::STATE_{i})).parent)
+                }};
+                {}
+            }}
         }}
 "#,
             with_side_args(&arguments)

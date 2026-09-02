@@ -92,7 +92,7 @@ fn main() {
         threads: [thread(1), thread(2), thread(3), thread(4)],
     };
 
-    lifecycle::started(0, &process);
-    lifecycle::exited(0, &process);
-    scheduling::preempted(&process, &thread(7));
+    side_event!(lifecycle::started, 0, &process);
+    side_event!(lifecycle::exited, 0, &process);
+    side_event!(scheduling::preempted, &process, &thread(7));
 }

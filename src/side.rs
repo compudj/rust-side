@@ -1626,6 +1626,31 @@ const _: [(); 72] = [(); size_of::<SideEventField>()];
 const _: [(); 8 + 3 * size_of::<*const c_void>()] = [(); size_of::<SideEventState0>()];
 const _: [(); 64] = [(); size_of::<SideEventDescription>()];
 
+/// Emit an event of a group, asking whether it is enabled before its
+/// arguments are worked out.
+///
+/// A group gives each of its events a function, which is the plain way
+/// to emit one; but the arguments of a function are evaluated before it
+/// is entered, including when nothing is listening. This asks first, so
+/// an argument which costs something, or which has an effect of its
+/// own, is not reached at all while the event is disabled:
+///
+/// ```ignore
+/// side_event!(trace::request, id, render(&body));
+/// ```
+///
+/// The path is written here and resolves here, which is what lets one
+/// macro serve every event: `trace::request`, `crate::trace::request`,
+/// or `request` where it has been brought in with `use`.
+#[macro_export]
+macro_rules! side_event {
+    ($($path:ident)::+ $(, $arg:expr)* $(,)?) => {{
+        if $($path)::+::enabled() {
+            $($path)::+::emit($($arg),*);
+        }
+    }};
+}
+
 /// Describe a structure in an object of its own.
 ///
 /// Events laid out in another object cannot reach a description by a
