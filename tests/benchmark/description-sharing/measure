@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# What grouping events into one provider saves, and when.
+#
+#   ./measure                 # 1000 events
+#   NR_EVENTS=100 ./measure
+#
+# See README.md for what the numbers mean.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+report="$(mktemp)"
+trap 'rm -f "$report"' EXIT
+
+nr_events="${NR_EVENTS:-1000}"
+export NR_EVENTS="$nr_events"
+
+# The console tracer is what makes a description be read at all.
+resolve_tracer() {
+	local dir token
+	if [[ -n "${SIDE_CONSOLE_TRACER:-}" ]]; then
+		printf '%s\n' "$SIDE_CONSOLE_TRACER"
+		return 0
+	fi
+	for token in $(pkg-config --libs-only-L libside-console-tracer 2>/dev/null); do
+		dir="${token#-L}"
+		for candidate in "$dir"/libside-console-tracer.so*; do
+			[[ -r "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+		done
+	done
+	return 1
+}
+
+library_path() {
+	local token dirs=() IFS=:
+	for token in $(pkg-config --libs-only-L libside libside-console-tracer 2>/dev/null); do
+		dirs+=("${token#-L}")
+	done
+	printf '%s\n' "${dirs[*]:-}"
+}
+
+section_size() {
+	readelf -SW "$1" | awk -v want="$2" '
+		$0 ~ ("[ \t]" want "[ \t]") { print strtonum("0x" $6); found = 1; exit }
+		END { if (!found) print 0 }'
+}
+
+relocations_in() {
+	local start size
+	read -r start size < <(readelf -SW "$1" | awk -v want="$2" '
+		$0 ~ ("[ \t]" want "[ \t]") { print strtonum("0x" $4), strtonum("0x" $6); exit }')
+	[[ -z "${start:-}" ]] && { echo 0; return; }
+	readelf -rW "$1" | awk -v s="$start" -v e="$((start + size))" '
+		NF > 3 && $1 ~ /^[0-9a-f]+$/ {
+			v = strtonum("0x" $1); if (v >= s && v < e) n++
+		}
+		END { print n + 0 }'
+}
+
+# One run under the probe, reported as: pages resident dirtied rss.
+probe() {
+	local program="$1" tracer="${2:-}"
+	local preload="$here/pagemap-probe.so" path
+	[[ -n "$tracer" ]] && preload="$preload $tracer"
+	path="$(library_path)"
+	: > "$report"
+	PROBE_REPORT="$report" LD_PRELOAD="$preload" \
+		LD_LIBRARY_PATH="$path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+		"$program" > /dev/null 2>&1 || true
+	awk '
+		$1 == "side_event_description" { pages = $4; resident = $6; dirty = $8 }
+		$1 == "process" { rss = $2 }
+		END { printf "%d %d %d %d\n", pages, resident, dirty, rss }
+	' "$report"
+}
+
+echo "Building the probe"
+gcc -shared -fPIC -Wall -Wextra -o "$here/pagemap-probe.so" "$here/pagemap-probe.c"
+
+echo "Writing $nr_events events"
+"$here/gen-instrumentation" > /dev/null
+
+echo "Building"
+( cd "$here/generated" && cargo build --release )
+bin="$here/generated/target/release"
+
+tracer="$(resolve_tracer || true)"
+if [[ -z "$tracer" ]]; then
+	echo
+	echo "libside's console tracer was not found; set SIDE_CONSOLE_TRACER to"
+	echo "its .so to measure what a description costs once something reads it."
+fi
+
+for shape in shared scalar; do
+	echo
+	if [[ "$shape" = shared ]]; then
+		echo "$nr_events events whose fields reach a structure"
+	else
+		echo "$nr_events events of scalar fields, which share nothing"
+	fi
+	printf '%-34s %12s %12s %8s\n' '' grouped ungrouped saved
+
+	declare -A got
+	for form in grouped ungrouped; do
+		program="$bin/$shape-$form"
+		got[$form.file]=$(stat -c %s "$program")
+		got[$form.desc]=$(section_size "$program" side_event_description)
+		got[$form.state]=$(section_size "$program" side_event_state)
+		got[$form.reloc]=$(relocations_in "$program" side_event_description)
+
+		read -r pages resident dirty rss < <(probe "$program")
+		got[$form.quiet]="$resident of $pages"
+		got[$form.quietrss]="$rss"
+
+		if [[ -n "$tracer" ]]; then
+			read -r pages resident dirty rss < <(probe "$program" "$tracer")
+			got[$form.read]="$resident of $pages"
+			got[$form.dirty]="$dirty"
+			got[$form.readrss]="$rss"
+		fi
+	done
+
+	saved() {
+		local a="$1" b="$2"
+		[[ "$b" -eq 0 ]] && { echo "-"; return; }
+		echo "$(( (b - a) * 100 / b ))%"
+	}
+	printf '%-34s %12s %12s %8s\n' 'file, bytes' "${got[grouped.file]}" "${got[ungrouped.file]}" "$(saved "${got[grouped.file]}" "${got[ungrouped.file]}")"
+	printf '%-34s %12s %12s %8s\n' 'side_event_description, bytes' "${got[grouped.desc]}" "${got[ungrouped.desc]}" "$(saved "${got[grouped.desc]}" "${got[ungrouped.desc]}")"
+	printf '%-34s %12s %12s %8s\n' 'side_event_state, bytes' "${got[grouped.state]}" "${got[ungrouped.state]}" "$(saved "${got[grouped.state]}" "${got[ungrouped.state]}")"
+	printf '%-34s %12s %12s %8s\n' 'relocations into the description' "${got[grouped.reloc]}" "${got[ungrouped.reloc]}" ''
+	printf '%-34s %12s %12s %8s\n' 'pages held, nothing listening' "${got[grouped.quiet]}" "${got[ungrouped.quiet]}" ''
+	printf '%-34s %12s %12s %8s\n' 'rss, nothing listening, kB' "${got[grouped.quietrss]}" "${got[ungrouped.quietrss]}" "$(saved "${got[grouped.quietrss]}" "${got[ungrouped.quietrss]}")"
+	if [[ -n "$tracer" ]]; then
+		printf '%-34s %12s %12s %8s\n' 'pages held, tracer reading' "${got[grouped.read]}" "${got[ungrouped.read]}" ''
+		printf '%-34s %12s %12s %8s\n' 'of those, dirtied' "${got[grouped.dirty]}" "${got[ungrouped.dirty]}" ''
+		printf '%-34s %12s %12s %8s\n' 'rss, tracer reading, kB' "${got[grouped.readrss]}" "${got[ungrouped.readrss]}" "$(saved "${got[grouped.readrss]}" "${got[ungrouped.readrss]}")"
+	fi
+	unset got
+done

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Write the programs the benchmark measures.
+
+Four of them, from two questions crossed. Whether the events are grouped
+into one provider or stand on their own is what is being measured;
+whether their fields reach a structure is what decides how much there is
+to share, and the scalar pair is there to show the floor.
+
+The programs contain nothing but the instrumentation: main() returns
+immediately, so every section is attributable to it.
+"""
+
+import os
+import sys
+
+NR_EVENTS = int(os.environ.get("NR_EVENTS", "1000"))
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(HERE, "generated")
+
+PREAMBLE = """#![allow(dead_code, unused_imports)]
+
+use libside::*;
+"""
+
+STRUCTS = """
+#[derive(SideGather)]
+struct ThreadInfo {
+    id: u32,
+    prio: i32,
+    running: bool,
+}
+
+#[derive(SideGather)]
+struct ProcessInfo {
+    pid: u32,
+    ppid: u32,
+    nice: i32,
+    alive: bool,
+    main_thread: ThreadInfo,
+    threads: [ThreadInfo; 4],
+}
+"""
+
+FIELDS = {
+    "shared": "seq: u32, process: &ProcessInfo",
+    "scalar": "seq: u32, when: u64, delta: i32, ok: bool",
+}
+
+
+def event(index, fields, indent):
+    return (
+        '{i}define_event!(ev{n}, provider: "rust", event: "ev{n}", '
+        "level: SIDE_LOGLEVEL_INFO,\n"
+        "{i}    fields: ({f}));"
+    ).format(i=indent, n=index, f=fields)
+
+
+def program(shape, grouped):
+    fields = FIELDS[shape]
+    body = PREAMBLE + (STRUCTS if shape == "shared" else "")
+    events = "\n".join(
+        event(i, fields, "    " if grouped else "") for i in range(NR_EVENTS)
+    )
+    if grouped:
+        body += "\n#[libside::events]\nmod trace {\n    use super::*;\n" + events + "\n}\n"
+    else:
+        body += "\n" + events + "\n"
+    return body + "\nfn main() {}\n"
+
+
+def main():
+    os.makedirs(os.path.join(OUT, "src", "bin"), exist_ok=True)
+
+    with open(os.path.join(OUT, "Cargo.toml"), "w") as f:
+        f.write(
+            "# Written by gen-instrumentation. Kept out of the crate it\n"
+            "# measures, so that building that crate never builds these.\n"
+            '[package]\n'
+            'name = "description-sharing"\n'
+            'version = "0.0.0"\n'
+            'edition = "2021"\n'
+            '\n'
+            '[dependencies]\n'
+            'libside-rust = { path = "../../../.." }\n'
+        )
+
+    for shape in FIELDS:
+        for grouped in (True, False):
+            name = "{}-{}".format(shape, "grouped" if grouped else "ungrouped")
+            path = os.path.join(OUT, "src", "bin", name + ".rs")
+            with open(path, "w") as f:
+                f.write(program(shape, grouped))
+            print("{} events -> {}".format(NR_EVENTS, os.path.relpath(path, HERE)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
