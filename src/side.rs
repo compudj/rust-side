@@ -1646,6 +1646,14 @@ const _: [(); 64] = [(); size_of::<SideEventDescription>()];
 macro_rules! side_event {
     ($($path:ident)::+ $(, $arg:expr)* $(,)?) => {{
         if $($path)::+::enabled() {
+            /*
+             * Everything past here is the unlikely half. Saying so is
+             * what moves it off the straight line a program which is
+             * not being traced runs down, and it stays inlined, which a
+             * cold function of its own would not: that would cost a
+             * call every time the event *is* enabled.
+             */
+            ::core::hint::cold_path();
             $($path)::+::emit($($arg),*);
         }
     }};
@@ -1703,6 +1711,7 @@ macro_rules! __emit_event_call_macro {
         macro_rules! $name {
             ($d first_value:expr, $d($d field:ident : $d value:expr),* $d(,)?) => {{
                 if unsafe { $module::enabled() } {
+                    ::core::hint::cold_path();
                     let arguments = $module::__EventArguments {
                         $first: $d first_value,
                         $d($d field: $d value),*
@@ -1712,6 +1721,7 @@ macro_rules! __emit_event_call_macro {
             }};
             ($d($d value:expr),* $d(,)?) => {{
                 if unsafe { $module::enabled() } {
+                    ::core::hint::cold_path();
                     $module::function($d($d value),*);
                 }
             }};

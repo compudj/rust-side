@@ -578,6 +578,9 @@ fn group_body(events: &[Event]) -> String {
             }}
 
             /// Emit it, without asking again.
+            ///
+            /// Inlined, into the unlikely half of the branch
+            /// `side_event!()` writes around it.
             #[inline(always)]
             pub fn emit({signature}) {{
                 let state = unsafe {{

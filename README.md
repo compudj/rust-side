@@ -144,7 +144,15 @@ if trace::process_started::enabled() {      // where the answer is wanted
 `side_event!()` asks whether the event is enabled before it works out
 the arguments, so one which costs something, or has an effect of its
 own, is not reached at all while nothing is listening -- which is what
-`tracepoint()` and `side_event()` are macros for. It is one macro for
+`tracepoint()` and `side_event()` are macros for. It says that half of
+the branch is the unlikely one, which leaves an instrumented function
+with a load, a test and a branch it does not take on the path it runs
+when nothing is listening:
+
+```
+    cmp   qword ptr [rip + ...STATE_0+8], 0
+    jne   .LBB6_8                    ; everything else, laid out below
+``` It is one macro for
 every event rather than one per event: the path is written at the call
 site and resolves there, which is what lets it name neither the module
 the event lives in nor the crate.

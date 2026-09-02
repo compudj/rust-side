@@ -112,6 +112,28 @@ with the range they spanned beside it.
 
 Compare the columns of one run rather than one column across runs.
 
+## What the filtered cases do not measure
+
+In both filter cases the event is *enabled* -- the filter runs and then
+rejects -- so the branch a call site writes around the emission is taken
+on every one of the five million iterations. The emission is marked as
+the unlikely half of that branch, which is what keeps it off the path of
+a program that is not being traced; measuring it with the branch always
+taken measures precisely the case it is not for, and costs about two
+nanoseconds against leaving it on the straight line.
+
+That is the right trade to make and the wrong number to read as the cost
+of instrumentation. The case the hint is for is the disabled one, which
+is the row above, and the shape it produces is worth looking at rather
+than timing:
+
+    .LBB6_2:
+        cmp   qword ptr [rip + ...STATE_0+8], 0
+        jne   .LBB6_8                    ; the emission, laid out below
+        inc   r12
+        cmp   rdi, r12
+        jne   .LBB6_2
+
 ## How many repetitions
 
 Enough that the interval does not span zero, which depends entirely on
