@@ -30,6 +30,13 @@ between them standing. Running all the repetitions of one program before
 the next puts the drift between the columns instead, where it is
 indistinguishable from what is being measured.
 
+What each program costs over the first is reported as the median of the
+paired differences, with the interval which holds it 95 times out of a
+hundred and how many repetitions agreed on its sign. An interval which
+spans zero is a case the repetitions did not resolve, and saying so is
+the point: a difference printed without one cannot be told from the
+noise it was drawn out of.
+
 Before timing anything, each traced case is run once with a small count
 into a session which does write to disk, and the events which came out
 are counted. A silently disabled event measures as a very fast disabled
@@ -41,6 +48,7 @@ touched: the session is destroyed on the way out.
 
 import argparse
 import os
+import random
 import pathlib
 import statistics
 import subprocess
@@ -51,7 +59,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 CPU = os.environ.get("BENCH_CPU", "3")
 ITERS = int(os.environ.get("BENCH_ITERS", "5000000"))
 WARMUP = int(os.environ.get("BENCH_WARMUP", "1000000"))
-REPS = int(os.environ.get("BENCH_REPS", "7"))
+REPS = int(os.environ.get("BENCH_REPS", "21"))
 VERIFY_ITERS = int(os.environ.get("BENCH_VERIFY_ITERS", "2000"))
 
 EVENT = "side_benchmark:u32"
@@ -204,11 +212,38 @@ def cell(values):
     return f"{statistics.median(values):6.2f} [{min(values):5.2f}-{max(values):5.2f}]"
 
 
+def paired(mine, theirs):
+    """
+    What one program costs over another, taken a repetition at a time.
+
+    Repetition r of every program was run under the same conditions, so
+    the difference of the pair is what the drift they share cancels out
+    of. Reported as the median of those differences, the interval which
+    holds it 95 times out of a hundred, and how many of the repetitions
+    agreed on its sign -- which is what says whether there is anything
+    there at all, without assuming the differences are of any particular
+    shape.
+    """
+    diffs = [b - a for a, b in zip(theirs, mine)]
+    medians = sorted(
+        statistics.median(random.choices(diffs, k=len(diffs)))
+        for _ in range(4000)
+    )
+    lo, hi = medians[100], medians[3899]
+    agree = sum(1 for d in diffs if d > 0)
+    if agree * 2 < len(diffs):
+        agree = len(diffs) - agree
+    return (f"{statistics.median(diffs):+6.2f} [{lo:+5.2f},{hi:+5.2f}]"
+            f" {agree:>2}/{len(diffs)}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     p.add_argument("--no-verify", action="store_true",
                    help="skip the check that each case records what it should")
     p.add_argument("--no-build", action="store_true", help="use what is already built")
+    p.add_argument("--raw", action="store_true",
+                   help="print every repetition, in the order they were taken")
     args = p.parse_args()
 
     ust_lib = find_library("liblttng-ust.so*", ["lttng-ust"], "UST_LIB")
@@ -230,6 +265,14 @@ def main():
         for name, values in measure(ust_lib, side_dirs, expr).items():
             results[(name, mode)] = values
 
+    if args.raw:
+        for mode in MODES:
+            print(mode)
+            for name, _ in CASES:
+                values = " ".join(f"{v:7.2f}" for v in results[(name, mode)])
+                print(f"  {name:<12}{values}")
+        print()
+
     width = 22
     print(f"{'case':<28}" + "".join(f"{n:<{width}}" for n, _ in CASES))
     print(f"{'':<28}" + "".join(f"{'median [min - max]':<{width}}" for _ in CASES))
@@ -242,18 +285,20 @@ def main():
     print()
 
     base = CASES[0][0]
+    width = 27
     print(f"{'against ' + base:<28}" + "".join(
         f"{n:<{width}}" for n, _ in CASES[1:]))
+    print(f"{'':<28}" + "".join(
+        f"{'median [95% of it] agree':<{width}}" for _ in CASES[1:]))
     print("-" * (28 + width * (len(CASES) - 1)))
     for mode in MODES:
         row = f"{LABELS[mode]:<28}"
-        b = statistics.median(results[(base, mode)])
         for name, _ in CASES[1:]:
-            m = statistics.median(results[(name, mode)])
-            row += f"{m - b:>+7.2f}  {m / b:>5.2f}x       "
+            row += f"{paired(results[(name, mode)], results[(base, mode)]):<{width}}"
         print(row)
     print()
-    print("nanoseconds per event")
+    print("nanoseconds per event. An interval which spans zero is a case this")
+    print(f"many repetitions did not resolve; the width falls as 1/sqrt(n).")
     return 0
 
 

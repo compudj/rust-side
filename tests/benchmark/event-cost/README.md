@@ -42,21 +42,28 @@ field separates the interpreter's field load from the rest.
 
 ## What it says
 
-Nanoseconds per event, median of seven repetitions, one machine, one
-run:
+What each Rust program costs over the C one, in nanoseconds per event,
+as the median of the paired differences over 21 repetitions with the
+interval which holds it 95 times out of a hundred:
 
-| case | C | Rust macro | Rust group |
-|---|---:|---:|---:|
-| disabled | 0.23 | 0.24 | 0.23 |
-| recorded to ring buffer | 132.27 | 133.57 | 132.86 |
-| filter `1 == 0` | 17.30 | 17.78 | 17.77 |
-| filter on the payload field | 22.94 | 23.47 | 23.56 |
+| case | Rust macro | Rust group |
+|---|---|---|
+| disabled | −0.01 [−0.03, +0.00] 15/21 | −0.02 [−0.03, +0.01] 14/21 |
+| recorded to ring buffer | +0.99 [−0.48, +2.01] 12/21 | +0.79 [−1.32, +2.04] 14/21 |
+| filter `1 == 0` | **+0.58 [+0.41, +0.64] 18/21** | **+0.52 [+0.41, +0.66] 18/21** |
+| filter on the payload field | **+0.59 [+0.48, +0.70] 19/21** | **+0.58 [+0.47, +0.73] 19/21** |
 
-Over two runs every difference falls between −2.4 and +1.3 ns, and the
-only one which keeps its sign is the filtered path, where Rust is half a
-nanosecond to a nanosecond behind. Nothing separates the two Rust
-programs: the function a group generates costs what the macro costs, so
-grouping is free at the call site as well as cheaper in memory.
+Two of the four are resolved, and they say the same thing: reaching a
+filter from Rust costs **a little over half a nanosecond** more than
+reaching it from the C macro. Nothing separates the two Rust programs,
+so the function a group generates costs what the macro costs: grouping
+is free at the call site as well as cheaper in memory.
+
+The other two are not resolved, and the table says so rather than
+letting a number be read as a finding. Disabled is a predicted branch in
+all three and there is nothing there to find. Recording is dominated by
+the ring buffer, whose spread swamps anything the frontend could
+contribute; see below for what it would take.
 
 ## How it is measured
 
@@ -69,6 +76,13 @@ scales its frequency always does -- moves every column of a repetition
 together, which leaves the comparison between them standing; running one
 program to completion first puts the drift *between* the columns, where
 it cannot be told apart from what is being measured.
+
+**The difference is taken a repetition at a time.** Repetition *r* of
+every program ran under the same conditions, so the pair cancels the
+drift they share; the figure reported is the median of those
+differences, not the difference of the two medians. It is worth about a
+factor of two: for the filter on the field, seven repetitions place the
+paired figure to ±0.13 ns and the unpaired one to ±0.26.
 
 **Each case is checked before anything is timed.** A short run goes into
 a session which writes to disk, and the events which came out are
@@ -89,12 +103,37 @@ with the range they spanned beside it.
 |---|---|---|
 | `BENCH_ITERS` | 5000000 | events in a timed repetition |
 | `BENCH_WARMUP` | 1000000 | events in the warmup loop |
-| `BENCH_REPS` | 7 | repetitions, of which the median is reported |
+| `BENCH_REPS` | 21 | repetitions (see below) |
 | `BENCH_CPU` | 3 | CPU to pin to |
 | `BENCH_VERIFY_ITERS` | 2000 | events in the run which is counted |
 | `UST_LIB` | what `pkg-config` finds | tracer to preload |
 
 Compare the columns of one run rather than one column across runs.
+
+## How many repetitions
+
+Enough that the interval does not span zero, which depends entirely on
+the case. One repetition of the paired difference has this much spread:
+
+| case | spread of one difference | 21 repetitions place it to |
+|---|---:|---:|
+| disabled | 0.08 | ±0.03 |
+| filter `1 == 0` | 0.56 | ±0.12 |
+| filter on the payload field | 0.54 | ±0.12 |
+| recorded to ring buffer | 4.53 | ±1.4 |
+
+Seven, which is what this used to default to, leaves three of the four
+spanning zero: it resolves the constant filter and nothing else. The
+default is 21, which resolves both filter cases, and the two which
+remain unresolved there are unresolved for reasons more repetitions do
+not fix.
+
+The width falls as 1 / sqrt(n), so bringing the recorded case to ±0.5 ns
+would take around 165 repetitions and some seven minutes of that case
+alone. It is not worth it: the ring buffer is the same code under all
+three columns, the frontends cannot be what makes it vary, and a
+difference of that size in a 130 ns path is not what anyone chooses a
+frontend on.
 
 ## Note
 
