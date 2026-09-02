@@ -5,7 +5,14 @@ Experimental Rust frontend for `libside`.
 This crate is intentionally separate from the `libside` source tree. It provides:
 
 - a small Rust FFI layer for the `side_call` ABI,
-- a `define_event!` declaration macro that emits libside metadata and a Rust inline backend,
+- `define_event!`, which declares an event and gives it a macro of its
+  own name,
+- `#[libside::events]`, which makes a module a provider: its events are
+  described together, so a type two of them use is described once, and
+  `side_event!()` emits them,
+- `#[derive(SideGather)]`, which describes a Rust struct so libside can
+  read its fields, and `define_type!`, which describes one on its own so
+  that other providers can reach it with `side_extern()`,
 - Cargo-based linking against an installed or in-tree `libside`.
 
 ## Toolchain
@@ -30,6 +37,14 @@ When `LIBSIDE_LIB_DIR` is set, the crate links `-lside` from that directory dire
 ## Current scope
 
 This first version only covers non-variadic `side_call` events with fixed fields.
+
+There are two ways to declare one, and they are called differently. An
+event on its own gets a macro of its own name, and takes named
+arguments; an event in a provider -- a module marked
+`#[libside::events]`, which is what lets its events share the
+descriptions of their types -- is reached through `side_event!()` and
+the path which names it. Both ask whether the event is enabled before
+they work out the arguments.
 
 Example:
 
@@ -119,43 +134,76 @@ The events are written exactly as they are on their own; the module is
 the only new thing. `examples/provider.rs` is three events sharing two
 structures: **2640 bytes of description ungrouped, 1552 grouped**, the
 same behaviour and no relocation either way.
-`tests/benchmark/description-sharing` weighs it at a thousand, and
-`tests/benchmark/event-cost` weighs what an event costs to emit. What is shared is the
-description of a structure, which is the same bytes wherever it is used;
-the 64 byte type at each point of use still carries its own offset and
-access mode, exactly as `side_static_define_struct` and
-`side_field_gather_struct` divide the work in C.
+
+What is shared is the description of a structure, which is the same
+bytes wherever it is used; the 64 byte type at each point of use still
+carries its own offset and access mode, exactly as
+`side_static_define_struct` and `side_field_gather_struct` divide the
+work in C.
+
+The two benchmarks weigh the two halves of it:
+`tests/benchmark/description-sharing` what grouping a thousand events
+saves, and `tests/benchmark/event-cost` what one event costs to emit.
 
 Two structures which describe the same way *are* the same description,
 so what is compared is the shape rather than which Rust type it came
 from. Merging them is right, not a coincidence to be avoided.
 
 All the events of a group register with one call, and each becomes a
-module of its own name holding `enabled()` and `emit()`:
+module of its own name holding `enabled()` and `emit()`. `side_event!()`
+is what reaches them:
 
 ```rust
 side_event!(trace::process_started, 0, &process);
+```
 
-if trace::process_started::enabled() {      // where the answer is wanted
-    ...                                     // for something else too
+It is one macro for every event rather than one per event: the path is
+written at the call site and resolves there, which is what lets it name
+neither the module the event lives in nor the crate. Any way of writing
+that path works -- `trace::process_started`,
+`crate::trace::process_started`, or `process_started` where it has been
+brought in with `use`.
+
+It asks whether the event is enabled before it works out the arguments,
+so one which costs something, or has an effect of its own, is not
+reached at all while nothing is listening. That is what `tracepoint()`
+and `side_event()` are macros for, and it is why a group generates no
+function of the event's own name: there is no shorter spelling which
+quietly evaluates its arguments.
+
+It also says that half of the branch is the unlikely one, so the
+emission is laid out past the return rather than between the work a
+function does and its end. What an instrumented function runs while
+nothing is listening is a load, a test, and a branch it does not take:
+
+```
+.LBB12_8:
+        mov   rcx, qword ptr [rip + ...STATE_0+8]
+        test  rcx, rcx
+        jne   .LBB12_9                ; the emission, laid out below
+.LBB12_10:
+        xor   eax, 1515870810         ; the rest of the function
+        add   rsp, 48
+        pop   rbx
+        ret
+```
+
+The load is a relaxed atomic one, which is how `side_event_enabled()`
+reads it in C: a tracer writes that word from another thread, and it is
+read here rather than remembered.
+
+`examples/asmcheck.rs` is where that came from, and carries the command
+which regenerates it. It has both forms, since an event of a group and
+one declared on its own compile differently.
+
+Where the answer is wanted for something else as well, the two halves
+are public and can be used apart:
+
+```rust
+if trace::process_started::enabled() {
+    trace::process_started::emit(seq, &render(&body));
 }
 ```
-
-`side_event!()` asks whether the event is enabled before it works out
-the arguments, so one which costs something, or has an effect of its
-own, is not reached at all while nothing is listening -- which is what
-`tracepoint()` and `side_event()` are macros for. It says that half of
-the branch is the unlikely one, which leaves an instrumented function
-with a load, a test and a branch it does not take on the path it runs
-when nothing is listening:
-
-```
-    cmp   qword ptr [rip + ...STATE_0+8], 0
-    jne   .LBB6_8                    ; everything else, laid out below
-``` It is one macro for
-every event rather than one per event: the path is written at the call
-site and resolves there, which is what lets it name neither the module
-the event lives in nor the crate.
 
 A standalone `define_event!` keeps its own macro and its named
 arguments; grouping is additive, and nothing changes for an event which
