@@ -5,6 +5,7 @@ use alloc::ffi::CString;
 use core::any::Any;
 use core::ffi::{c_char, c_void, CStr};
 use core::mem::{offset_of, size_of};
+use core::sync::atomic::AtomicUsize;
 use core::ptr::null;
 
 #[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))]
@@ -568,11 +569,17 @@ pub struct SideEventState {
  * a description holds no address at all, not even of its own state.
  */
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct SideEventState0 {
     pub parent: SideEventState,
     pub nr_callbacks: u32,
-    pub enabled: usize,
+    /*
+     * Written by a tracer, in another thread, when it enables or
+     * disables the event, and read at every call site. An atomic of the
+     * width libside declares it, `uintptr_t enabled', so that reading
+     * it while a tracer writes it is a defined thing to do rather than
+     * a race the compiler is entitled to assume cannot happen.
+     */
+    pub enabled: AtomicUsize,
     pub callbacks: *const c_void,
     pub desc: *mut SideEventDescription,
 }
@@ -1830,7 +1837,7 @@ macro_rules! define_event {
                         version: $crate::side::SIDE_EVENT_STATE_ABI_VERSION,
                     },
                     nr_callbacks: 0,
-                    enabled: 0,
+                    enabled: ::core::sync::atomic::AtomicUsize::new(0),
                     callbacks: ::core::ptr::addr_of!($crate::side::side_empty_callback).cast(),
                     desc: ::core::ptr::addr_of_mut!(EVENT_DESC)
                         .cast::<$crate::side::SideEventDescription>(),
@@ -1869,8 +1876,14 @@ macro_rules! define_event {
             static EVENT_REGISTER_FINI: unsafe extern "C" fn() = unregister_event;
 
             pub(crate) unsafe fn enabled() -> bool {
-                let enabled_ptr = ::core::ptr::addr_of!((*::core::ptr::addr_of_mut!(EVENT_STATE)).enabled);
-                unsafe { ::core::ptr::read_volatile(enabled_ptr) != 0 }
+                /*
+                 * Relaxed, which is what side_event_enabled() reads it
+                 * with: nothing is ordered against it, and the only
+                 * thing asked of the compiler is that it read it here
+                 * rather than remember what it held.
+                 */
+                let enabled = unsafe { &(*::core::ptr::addr_of_mut!(EVENT_STATE)).enabled };
+                enabled.load(::core::sync::atomic::Ordering::Relaxed) != 0
             }
 
             unsafe fn state() -> *const $crate::side::SideEventState {

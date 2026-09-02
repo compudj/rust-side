@@ -522,7 +522,7 @@ fn group_body(events: &[Event]) -> String {
                     version: ::libside::side::SIDE_EVENT_STATE_ABI_VERSION,
                 }},
                 nr_callbacks: 0,
-                enabled: 0,
+                enabled: ::core::sync::atomic::AtomicUsize::new(0),
                 callbacks: ::core::ptr::addr_of!(::libside::side::side_empty_callback).cast(),
                 desc: unsafe {{
                     ::core::ptr::addr_of_mut!(DESC)
@@ -570,11 +570,16 @@ fn group_body(events: &[Event]) -> String {
             /// Whether a tracer is listening for this event.
             #[inline(always)]
             pub fn enabled() -> bool {{
-                unsafe {{
-                    let enabled = ::core::ptr::addr_of!(
-                        (*::core::ptr::addr_of_mut!(__side::STATE_{i})).enabled);
-                    ::core::ptr::read_volatile(enabled) != 0
-                }}
+                /*
+                 * Relaxed, which is what side_event_enabled() reads it
+                 * with: nothing is ordered against it, and the only
+                 * thing asked of the compiler is that it read it here
+                 * rather than remember what it held.
+                 */
+                let enabled = unsafe {{
+                    &(*::core::ptr::addr_of_mut!(__side::STATE_{i})).enabled
+                }};
+                enabled.load(::core::sync::atomic::Ordering::Relaxed) != 0
             }}
 
             /// Emit it, without asking again.
