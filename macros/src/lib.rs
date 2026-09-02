@@ -274,18 +274,109 @@ fn nested_struct_layout(type_: &str, offset: &str) -> Result<String, String> {
 /// unless they are laid out together, which is what this does. It is
 /// the same boundary a C translation unit gives libside, and the same
 /// thing a tracepoint provider has always been.
+///
+/// A group may also dump the state a tracer missed by starting late:
+///
+/// ```ignore
+/// #[libside::events(statedump = dump, mode = agent_thread)]
+/// mod trace { ... }
+/// ```
+///
+/// registers `dump` as the group's state dump callback, from the same
+/// constructor which registers the events and after them -- which is
+/// the order it has to be, since registering the callback takes a dump
+/// at once. The mode says who runs the callback: `agent_thread`, a
+/// thread libside spawns, or `polling`, the application, which the
+/// group then gives `statedump_pending()` and
+/// `run_pending_statedumps()` for.
 #[proc_macro_attribute]
 pub fn events(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return "compile_error!(\"side: #[events] takes no argument\");"
-            .parse()
-            .expect("generated valid compile error");
-    }
-    match events_impl(item) {
+    let statedump = match parse_group_statedump(attr) {
+        Ok(statedump) => statedump,
+        Err(message) => {
+            return format!("compile_error!({message:?});")
+                .parse()
+                .expect("generated valid compile error")
+        }
+    };
+    match events_impl(item, statedump.as_ref()) {
         Ok(output) => output.parse().expect("generated valid Rust"),
         Err(message) => format!("compile_error!({message:?});")
             .parse()
             .expect("generated valid compile error"),
+    }
+}
+
+/// The state dump of a group: whose callback, and who runs it.
+struct GroupStatedump {
+    /// The path of the callback, which takes a `StatedumpKey`.
+    callback: String,
+    /// The `side::StatedumpMode` variant, spelled as libside spells it.
+    mode: String,
+}
+
+/// Read `statedump = <path>, mode = polling | agent_thread`.
+///
+/// The mode is not defaulted. libside makes a C caller say it because
+/// the two are different bargains -- one spawns a thread, the other
+/// leaves the application owing a call -- and neither is a quiet
+/// default to hand somebody who wrote only `statedump = dump`.
+fn parse_group_statedump(attr: TokenStream) -> Result<Option<GroupStatedump>, String> {
+    let parts = split_on_comma(attr);
+    let mut callback = None;
+    let mut mode = None;
+
+    for part in parts.iter().filter(|part| !part.is_empty()) {
+        let equals = part
+            .iter()
+            .position(|token| matches!(token, TokenTree::Punct(punct) if punct.as_char() == '='))
+            .ok_or("side: #[events] takes `statedump = <callback>, mode = <mode>'")?;
+        let key = part[..equals]
+            .iter()
+            .map(TokenTree::to_string)
+            .collect::<String>();
+        let value = part[equals + 1..]
+            .iter()
+            .cloned()
+            .collect::<TokenStream>()
+            .to_string();
+        match key.as_str() {
+            "statedump" => callback = Some(value),
+            "mode" => {
+                mode = Some(match value.as_str() {
+                    "polling" => "Polling",
+                    "agent_thread" => "AgentThread",
+                    _ => {
+                        return Err(format!(
+                            "side: `{value}' is not a state dump mode; \
+                             it is `polling' or `agent_thread'"
+                        ))
+                    }
+                });
+            }
+            other => {
+                return Err(format!(
+                    "side: #[events] knows `statedump' and `mode', not `{other}'"
+                ))
+            }
+        }
+    }
+
+    match (callback, mode) {
+        (None, None) => Ok(None),
+        (Some(callback), Some(mode)) => Ok(Some(GroupStatedump {
+            callback,
+            mode: mode.to_string(),
+        })),
+        (Some(_), None) => Err("side: a state dump needs `mode = polling' -- the application \
+                                runs the callback from run_pending_statedumps() -- or \
+                                `mode = agent_thread' -- a thread libside spawns runs it"
+            .into()),
+        (None, Some(_)) => {
+            Err("side: `mode' says who runs a state dump callback, and no `statedump' \
+                 names one"
+                .into())
+        }
     }
 }
 
@@ -314,7 +405,7 @@ struct Event {
     attributes: String,
 }
 
-fn events_impl(item: TokenStream) -> Result<String, String> {
+fn events_impl(item: TokenStream, statedump: Option<&GroupStatedump>) -> Result<String, String> {
     let mut prefix = Vec::new();
     let mut body = None;
     let mut name = None;
@@ -374,7 +465,7 @@ fn events_impl(item: TokenStream) -> Result<String, String> {
 
     Ok(format!(
         "{prefix} mod {name} {{ {passthrough} {} }}",
-        group_body(&events)
+        group_body(&name, &events, statedump)
     ))
 }
 
@@ -506,7 +597,7 @@ fn argument_type(kind: &FieldKind) -> String {
     }
 }
 
-fn group_body(events: &[Event]) -> String {
+fn group_body(name: &str, events: &[Event], statedump: Option<&GroupStatedump>) -> String {
     /* Each structure described elsewhere, in order of first mention. */
     let mut targets: Vec<String> = Vec::new();
     for event in events {
@@ -635,11 +726,36 @@ fn group_body(events: &[Event]) -> String {
                     ::core::ptr::addr_of!(
                         (*::core::ptr::addr_of_mut!(__side::STATE_{i})).parent)
                 }};
-                {}
+                {emission}
+            }}
+
+            /// Emit it to the one tracer which asked for the state dump
+            /// `key` identifies, rather than to every tracer listening.
+            ///
+            /// For a state dump callback, which `side_statedump_event!()`
+            /// reaches this through. Emitting it outside one is what the
+            /// key makes impossible: there is nowhere else to get one.
+            #[inline(always)]
+            pub fn emit_statedump(
+                key: ::libside::side::StatedumpKey<'_>,
+                {signature}
+            ) {{
+                let state = unsafe {{
+                    ::core::ptr::addr_of!(
+                        (*::core::ptr::addr_of_mut!(__side::STATE_{i})).parent)
+                }};
+                {statedump_emission}
             }}
         }}
 "#,
-            with_side_args(&arguments)
+            emission = with_side_args(
+                &arguments,
+                "unsafe { ::libside::side::call(state, &[{args}]); }"
+            ),
+            statedump_emission = with_side_args(
+                &arguments,
+                "unsafe { ::libside::side::statedump_call(state, &[{args}], key); }"
+            ),
         ));
     }
 
@@ -660,6 +776,11 @@ fn group_body(events: &[Event]) -> String {
         .collect::<Vec<_>>();
     let nuses = uses.len();
     let (holes, desc_fields, desc_init) = description_object(&uses);
+    let (statedump_items, statedump_register, statedump_unregister, statedump_calls) =
+        match statedump {
+            None => (String::new(), String::new(), String::new(), String::new()),
+            Some(statedump) => group_statedump(name, statedump),
+        };
 
     format!(
         r#"
@@ -716,15 +837,21 @@ fn group_body(events: &[Event]) -> String {
             static mut HANDLE: *mut ::libside::side::SideEventsRegisterHandle =
                 ::core::ptr::null_mut();
 
+            {statedump_items}
+
             unsafe extern "C" fn register() {{
                 unsafe {{
                     HANDLE = ::libside::side::side_events_register(
                         ::core::ptr::addr_of_mut!(STATE_PTRS).cast(), {count});
+                    {statedump_register}
                 }}
             }}
 
             unsafe extern "C" fn unregister() {{
-                unsafe {{ ::libside::side::side_events_unregister(HANDLE); }}
+                unsafe {{
+                    {statedump_unregister}
+                    ::libside::side::side_events_unregister(HANDLE);
+                }}
             }}
 
             #[used]
@@ -736,9 +863,136 @@ fn group_body(events: &[Event]) -> String {
             static UNREGISTER: unsafe extern "C" fn() = unregister;
         }}
 
+        {statedump_calls}
+
         {calls}
 "#
     )
+}
+
+/// What a group's state dump adds: the callback libside can call, the
+/// registration, and -- in polling mode -- the two calls the
+/// application owes.
+///
+/// Returns what to declare inside `__side`, what `register()` and
+/// `unregister()` add, and what the group module itself gains.
+fn group_statedump(name: &str, statedump: &GroupStatedump) -> (String, String, String, String) {
+    let GroupStatedump { callback, mode } = statedump;
+
+    let items = format!(
+        r#"
+            /*
+             * The callback, given a type here rather than left to be
+             * checked where libside calls it: a signature which is
+             * wrong is then a mismatch which names the function and
+             * says what was wanted of it.
+             */
+            const _: fn(::libside::side::StatedumpKey<'_>) = {callback};
+
+            pub static mut STATEDUMP_HANDLE:
+                *mut ::libside::side::SideStatedumpRequestHandle =
+                    ::core::ptr::null_mut();
+
+            /*
+             * libside hands a state dump callback a key and nothing of
+             * the caller's, so the callback cannot be a closure. It
+             * needs to capture nothing: which group this is, is known
+             * here.
+             */
+            unsafe extern "C" fn statedump_callback(key: *mut ::core::ffi::c_void) {{
+                /*
+                 * The key is good until this returns and no longer,
+                 * which is what the branded key says: it borrows from
+                 * this call, so the callback cannot keep it.
+                 */
+                {callback}(unsafe {{ ::libside::side::StatedumpKey::from_raw(key) }});
+            }}
+"#
+    );
+
+    /*
+     * After the events, and not before. Registering the callback queues
+     * a state dump at once -- and in agent thread mode waits for it to
+     * be run before returning -- so an event this group dumps would be
+     * missed by the very first dump if it were not registered yet.
+     * Both happen here, in one constructor, because the order of a
+     * group's own .init_array entry against anything else's is not
+     * defined.
+     */
+    let register = format!(
+        r#"
+                    STATEDUMP_HANDLE =
+                        ::libside::side::side_statedump_request_notification_register(
+                            b"{name} ".as_ptr().cast(),
+                            statedump_callback,
+                            ::libside::side::StatedumpMode::{mode});
+"#
+    );
+
+    /* The reverse: the callback goes before the events it dumps. */
+    let unregister = r#"
+                    if !STATEDUMP_HANDLE.is_null() {
+                        ::libside::side::side_statedump_request_notification_unregister(
+                            STATEDUMP_HANDLE);
+                        STATEDUMP_HANDLE = ::core::ptr::null_mut();
+                    }
+"#
+    .to_string();
+
+    /*
+     * Only a polling handle answers these: libside returns false and
+     * SIDE_ERROR_INVAL for an agent thread one, so writing them only
+     * for the mode which has them makes the choice of mode a thing the
+     * compiler knows rather than a runtime error.
+     */
+    let calls = if mode.as_str() == "Polling" {
+        r#"
+        /// Whether a tracer has asked this group for a state dump.
+        ///
+        /// The group was declared `mode = polling', so the application
+        /// is what runs its callback, and this is how it knows to.
+        pub fn statedump_pending() -> bool {
+            unsafe {
+                /*
+                 * Nothing was asked of a group which never registered
+                 * -- libside was finalized, or out of memory -- and
+                 * asking libside about a handle it did not give us
+                 * would be reading through a null pointer.
+                 */
+                if __side::STATEDUMP_HANDLE.is_null() {
+                    return false;
+                }
+                ::libside::side::side_statedump_poll_pending_requests(
+                    __side::STATEDUMP_HANDLE)
+            }
+        }
+
+        /// Run the group's state dump callback for every tracer which
+        /// has asked, on this thread, now.
+        ///
+        /// The obligation `mode = polling' takes on: a tracer which
+        /// asks waits until this is reached.
+        pub fn run_pending_statedumps() {
+            unsafe {
+                if __side::STATEDUMP_HANDLE.is_null() {
+                    return;
+                }
+                /*
+                 * The only thing this reports is a handle of the wrong
+                 * mode, which the handle above cannot be: it is written
+                 * for a polling group and no other.
+                 */
+                ::libside::side::side_statedump_run_pending_requests(
+                    __side::STATEDUMP_HANDLE);
+            }
+        }
+"#
+        .to_string()
+    } else {
+        String::new()
+    };
+
+    (items, register, unregister, calls)
 }
 
 /// The description as an object: the runs of bytes the const evaluator
@@ -797,14 +1051,17 @@ fn description_object(uses: &[String]) -> (String, String, String) {
 }
 
 /// The nest of closures which keeps every argument alive until the call.
-fn with_side_args(arguments: &[(String, String)]) -> String {
-    let mut body = format!(
-        "unsafe {{ ::libside::side::call(state, &[{}]); }}",
-        arguments
+///
+/// `call` is what to do once they all are, with `{args}` standing for
+/// the arguments as libside wants them.
+fn with_side_args(arguments: &[(String, String)], call: &str) -> String {
+    let mut body = call.replace(
+        "{args}",
+        &arguments
             .iter()
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
     );
     for (name, type_) in arguments.iter().rev() {
         body = format!(

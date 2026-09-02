@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::ffi::CString;
 use core::any::Any;
-use core::ffi::{c_char, c_void, CStr};
+use core::ffi::{c_char, c_int, c_void, CStr};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::AtomicUsize;
 use core::ptr::null;
@@ -656,6 +656,26 @@ pub struct SideEventsRegisterHandle {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct SideStatedumpRequestHandle {
+    _private: [u8; 0],
+}
+
+/// Who runs a state dump callback when a tracer asks for one.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatedumpMode {
+    /// The application does, from `run_pending_statedumps()`, which it
+    /// is then responsible for reaching often enough. For a
+    /// single-threaded program built around an event loop, which would
+    /// rather not gain a thread nor the locking one implies.
+    Polling = 0,
+    /// A thread libside spawns does. For a program which cannot promise
+    /// to poll, and for a library, which has no event loop of its own
+    /// to hang it off.
+    AgentThread = 1,
+}
+
 extern "C" {
     pub fn side_call(state: *const SideEventState, side_arg_vec: *const SideArgVec);
     pub fn side_events_register(
@@ -664,12 +684,85 @@ extern "C" {
     ) -> *mut SideEventsRegisterHandle;
     pub fn side_events_unregister(handle: *mut SideEventsRegisterHandle);
     pub static side_empty_callback: c_char;
+
+    pub fn side_statedump_call(
+        state: *const SideEventState,
+        side_arg_vec: *const SideArgVec,
+        statedump_request_key: *mut c_void,
+    );
+    pub fn side_statedump_request_notification_register(
+        state_name: *const c_char,
+        statedump_cb: unsafe extern "C" fn(statedump_request_key: *mut c_void),
+        mode: StatedumpMode,
+    ) -> *mut SideStatedumpRequestHandle;
+    pub fn side_statedump_request_notification_unregister(
+        handle: *mut SideStatedumpRequestHandle,
+    );
+    pub fn side_statedump_poll_pending_requests(
+        handle: *mut SideStatedumpRequestHandle,
+    ) -> bool;
+    pub fn side_statedump_run_pending_requests(
+        handle: *mut SideStatedumpRequestHandle,
+    ) -> c_int;
+}
+
+/// Which tracer asked for the state dump being taken.
+///
+/// A state dump is emitted to the one tracer which asked for it, rather
+/// than to every tracer listening, and this is what says which. It is
+/// handed to a state dump callback and **is valid only until that
+/// callback returns**, which is what the lifetime says: it borrows from
+/// the call, so it cannot be put in a static, sent to another thread,
+/// or kept for the next time. Copying it is free and copies the borrow
+/// with it.
+#[derive(Clone, Copy)]
+pub struct StatedumpKey<'a> {
+    key: *mut c_void,
+    /*
+     * A shared borrow of nothing, purely to carry the lifetime. The raw
+     * pointer is also what makes the key neither Send nor Sync, which
+     * is right: the callback's thread is the only one which may use it.
+     */
+    _brand: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> StatedumpKey<'a> {
+    /// Brand the key libside handed a state dump callback.
+    ///
+    /// # Safety
+    ///
+    /// `key` must be the key of the state dump under way, and `'a` must
+    /// not outlive the callback which was given it.
+    pub unsafe fn from_raw(key: *mut c_void) -> Self {
+        Self {
+            key,
+            _brand: core::marker::PhantomData,
+        }
+    }
+
+    /// The key as libside wants it.
+    pub fn as_raw(self) -> *mut c_void {
+        self.key
+    }
 }
 
 pub unsafe fn call(state: *const SideEventState, args: &[SideArg]) {
     let side_arg_vec = SideArgVec::new(args);
     unsafe {
         side_call(state, &side_arg_vec);
+    }
+}
+
+/// Emit an event to the one tracer which asked for this state dump,
+/// rather than to every tracer listening.
+pub unsafe fn statedump_call(
+    state: *const SideEventState,
+    args: &[SideArg],
+    key: StatedumpKey<'_>,
+) {
+    let side_arg_vec = SideArgVec::new(args);
+    unsafe {
+        side_statedump_call(state, &side_arg_vec, key.as_raw());
     }
 }
 
@@ -2025,6 +2118,35 @@ macro_rules! side_event {
              */
             ::core::hint::cold_path();
             $($path)::+::emit($($arg),*);
+        }
+    }};
+}
+
+/// Emit an event of a group as part of a state dump, to the one tracer
+/// which asked for it.
+///
+/// Written the same way as `side_event!()` with the key of the state
+/// dump under way between the path and the arguments:
+///
+/// ```ignore
+/// fn dump(key: StatedumpKey<'_>) {
+///     for task in tasks() {
+///         side_statedump_event!(trace::task, key, task.id, task.name);
+///     }
+/// }
+/// ```
+///
+/// It asks whether the event is enabled first, for the same reason
+/// `side_event!()` does -- a state dump walks state, and walking it is
+/// worth skipping when nothing would read the result. What it does not
+/// do is call the taken branch unlikely: a state dump callback runs
+/// because a tracer asked for one, so the emission is the expected
+/// half, not the exceptional one.
+#[macro_export]
+macro_rules! side_statedump_event {
+    ($($path:ident)::+, $key:expr $(, $arg:expr)* $(,)?) => {{
+        if $($path)::+::enabled() {
+            $($path)::+::emit_statedump($key $(, $arg)*);
         }
     }};
 }

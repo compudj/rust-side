@@ -258,6 +258,84 @@ A standalone `define_event!` keeps its own macro and its named
 arguments; grouping is additive, and nothing changes for an event which
 does not want it.
 
+## State dumps: what a tracer which started late missed
+
+An event says what changed. A tracer which starts after the change has
+nothing to tell it what the state was, and no amount of instrumentation
+at the points of change will help it: what it needs is to be told the
+state as it stands, once, when it starts. That is a state dump, and
+libside has a tracer ask for one.
+
+The callback belongs to a group:
+
+```rust
+#[libside::events(statedump = dump_tasks, mode = agent_thread)]
+mod tasks {
+    use super::*;
+
+    define_event!(
+        task_running,
+        provider: "rust",
+        event: "task_running",
+        level: SIDE_LOGLEVEL_INFO,
+        fields: (id: u32, name: &str),
+    );
+}
+
+fn dump_tasks(key: StatedumpKey<'_>) {
+    for (id, name) in TASKS.lock().unwrap().iter() {
+        side_statedump_event!(tasks::task_running, key, *id, name.as_str());
+    }
+}
+```
+
+`side_statedump_event!()` is `side_event!()` with the key between the
+path and the arguments, and emits to the **one tracer which asked**
+rather than to every tracer listening. It asks whether the event is
+enabled first, for the same reason -- walking state is worth skipping
+when nothing would read it -- but it does not call the taken branch
+unlikely: a dump callback runs because a tracer asked for one.
+
+**The key is the whole safety story.** libside hands the callback a key
+which is good until the callback returns and no later. `StatedumpKey<'_>`
+borrows from that call, so it cannot be put in a static, sent to another
+thread, or saved for the next dump; and since there is nowhere else to
+obtain one, an event cannot be emitted as part of a dump which is not
+happening.
+
+**The mode is not defaulted**, because the two are different bargains
+and neither is a quiet thing to hand somebody:
+
+- `mode = agent_thread` -- a thread libside spawns runs the callback.
+  The application owes nothing, which is what a library, or anything
+  without an event loop of its own, needs.
+- `mode = polling` -- the application runs it, and the group gains
+  `statedump_pending()` and `run_pending_statedumps()` for the purpose.
+  A tracer which asks waits until the application reaches them. Those
+  two functions exist only for a polling group, so choosing the wrong
+  mode is a name which is not there rather than an error at run time.
+
+**Why the callback hangs off the group and not off a constructor of your
+own.** Registering it queues a dump at once -- and in agent thread mode
+waits for that dump to run before returning -- so the events it emits
+have to be registered already. A group registers from its own
+`.init_array` entry, whose order against any other constructor is
+undefined, so the group registers both, in that order, and unregisters
+them in the reverse.
+
+The first dump therefore happens during that constructor, before `main`,
+and reports whatever state exists then, which is usually none. That is
+the right answer to the question rather than a disappointment: a state
+dump reports the state at the moment it is taken. The dump worth having
+is the one a tracer asks for when it starts, and LTTng-UST asks for one
+per session.
+
+`examples/statedump.rs` is both modes in one program: run it and start a
+session while it is running.
+
+A state dump is a group's, so `define_event!` on its own has no part in
+it: an event to be dumped goes in a `#[libside::events]` module.
+
 ## Crossing a group: `define_type!` and `side_extern()`
 
 A distance is between two bytes of one object, so a group can share
