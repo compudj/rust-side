@@ -13,6 +13,8 @@ This crate is intentionally separate from the `libside` source tree. It provides
 - `#[derive(SideGather)]`, which describes a Rust struct so libside can
   read its fields, and `define_type!`, which describes one on its own so
   that other providers can reach it with `side_extern()`,
+- attributes on an event and on the type of a field, which reach the
+  CTF2 metadata,
 - Cargo-based linking against an installed or in-tree `libside`.
 
 ## Toolchain
@@ -96,6 +98,53 @@ The current `SideGather` derive supports `bool`, fixed-width signed and unsigned
 members, nested structs, fixed-size arrays of nested structs, and `Vec<T>`
 members. The struct and any vector backing storage must remain valid for the
 duration of the event call.
+
+## Attributes
+
+An attribute is a { key, value } pair carried by an event or by the type
+of a field. They are written where C writes them: trailing, after the
+thing they belong to. A field's follow its type in brackets, an event's
+follow its field list.
+
+```rust
+define_event!(
+    request,
+    provider: "rust",
+    event: "request",
+    level: SIDE_LOGLEVEL_INFO,
+    fields: (
+        id: u32,
+        code: u32 [side_attr("std.integer.base", side_attr_u8(16))],
+    ),
+    attributes: [side_attr("std.event.note", side_attr_string("about the event"))],
+);
+```
+
+The value constructors are the ones C has: `side_attr_bool()`,
+`side_attr_u8()` through `_u64()`, `side_attr_s8()` through `_s64()`,
+`side_attr_string()` and `side_attr_null()`. Floats and 128-bit
+integers are in the ABI and not yet here.
+
+Two things become of an attribute which reaches LTTng-UST. It is carried
+into the CTF2 metadata as a user attribute, the key splitting at its
+last dot into a namespace and a name, so `std.integer.base` arrives as
+
+```json
+"attributes": { "std.integer": { "base": 16 } }
+```
+
+which happens whether or not anything understands it. And a few are
+understood: `std.integer.base` -- 2, 8, 10 or 16 -- becomes the CTF2
+`preferred-display-base`, so `lttng view` prints the field in that base.
+`std.blob.media-type` and `lttng.fmt.print-value` are the others, and
+want a byte array and an enumeration, neither of which this crate can
+describe yet.
+
+A structure keeps its attributes with its definition rather than at a
+field which reads through it, as it does in C, so
+`side_field_gather_struct()` takes none and neither does a field of a
+`#[derive(SideGather)]` type here. `examples/attributes.rs` is the whole
+of it.
 
 ## Providers: grouping events which share types
 

@@ -52,6 +52,18 @@ pub const SIDE_TYPE_BYTE_ORDER_HOST: u8 = SIDE_TYPE_BYTE_ORDER_LE;
 #[cfg(target_endian = "big")]
 pub const SIDE_TYPE_BYTE_ORDER_HOST: u8 = SIDE_TYPE_BYTE_ORDER_BE;
 
+pub const SIDE_ATTR_TYPE_NULL: u32 = 0;
+pub const SIDE_ATTR_TYPE_BOOL: u32 = 1;
+pub const SIDE_ATTR_TYPE_U8: u32 = 2;
+pub const SIDE_ATTR_TYPE_U16: u32 = 3;
+pub const SIDE_ATTR_TYPE_U32: u32 = 4;
+pub const SIDE_ATTR_TYPE_U64: u32 = 5;
+pub const SIDE_ATTR_TYPE_S8: u32 = 7;
+pub const SIDE_ATTR_TYPE_S16: u32 = 8;
+pub const SIDE_ATTR_TYPE_S32: u32 = 9;
+pub const SIDE_ATTR_TYPE_S64: u32 = 10;
+pub const SIDE_ATTR_TYPE_STRING: u32 = 16;
+
 pub const SIDE_NR_TYPE_LABEL: u16 = 48;
 pub const SIDE_NR_ATTR_TYPE: u16 = 17;
 
@@ -380,6 +392,40 @@ impl SideArgVec {
             len: args.len() as u32,
         }
     }
+}
+
+/// `struct side_type_raw_string`: a string a description reaches by a
+/// distance and a dynamic argument by an address.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct SideTypeRawString {
+    pub p: SideSelPtr,
+    pub unit_size: u8,
+    pub byte_order: u8,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub union SideAttrValuePayload {
+    pub bool_value: u8,
+    pub string_value: SideTypeRawString,
+    pub integer_value: SideIntegerValue,
+    pub padding: [u8; 32],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct SideAttrValue {
+    pub type_: u32,
+    pub u: SideAttrValuePayload,
+}
+
+/// `struct side_attr`: one { key, value } pair of an attribute list.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct SideAttr {
+    pub key: SideTypeRawString,
+    pub value: SideAttrValue,
 }
 
 #[repr(C, packed)]
@@ -744,11 +790,93 @@ const fn patch<const K: usize>(patches: &mut Patches<K>, at: usize, target: usiz
     patches.len += 1;
 }
 
+/// What an attribute holds.
+///
+/// The types libside gives an attribute value, of which these are the
+/// ones a description built here can carry; a float or a 128 bit
+/// integer would go the same way.
+#[derive(Clone, Copy)]
+pub enum AttrValue {
+    Null,
+    Bool(bool),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    S8(i8),
+    S16(i16),
+    S32(i32),
+    S64(i64),
+    String(&'static str),
+}
+
+/// One attribute of an event or of a type: a key and a value.
+#[derive(Clone, Copy)]
+pub struct Attr {
+    pub key: &'static str,
+    pub value: AttrValue,
+}
+
+/// An attribute, spelled as `side_attr()` spells one in C.
+pub const fn side_attr(key: &'static str, value: AttrValue) -> Attr {
+    Attr { key, value }
+}
+
+pub const fn side_attr_null() -> AttrValue {
+    AttrValue::Null
+}
+
+pub const fn side_attr_bool(value: bool) -> AttrValue {
+    AttrValue::Bool(value)
+}
+
+pub const fn side_attr_u8(value: u8) -> AttrValue {
+    AttrValue::U8(value)
+}
+
+pub const fn side_attr_u16(value: u16) -> AttrValue {
+    AttrValue::U16(value)
+}
+
+pub const fn side_attr_u32(value: u32) -> AttrValue {
+    AttrValue::U32(value)
+}
+
+pub const fn side_attr_u64(value: u64) -> AttrValue {
+    AttrValue::U64(value)
+}
+
+pub const fn side_attr_s8(value: i8) -> AttrValue {
+    AttrValue::S8(value)
+}
+
+pub const fn side_attr_s16(value: i16) -> AttrValue {
+    AttrValue::S16(value)
+}
+
+pub const fn side_attr_s32(value: i32) -> AttrValue {
+    AttrValue::S32(value)
+}
+
+pub const fn side_attr_s64(value: i64) -> AttrValue {
+    AttrValue::S64(value)
+}
+
+pub const fn side_attr_string(value: &'static str) -> AttrValue {
+    AttrValue::String(value)
+}
+
 /// A named field, of an event or of a gather structure.
 #[derive(Clone, Copy)]
 pub struct Field {
     pub name: &'static str,
     pub layout: Layout,
+    /*
+     * The attributes of the field's type, which is where libside keeps
+     * them: side_field_u32("x", side_attr_list(...)) sets the ones of
+     * the struct side_type_integer the field carries.
+     */
+    pub attributes: &'static [Attr],
 }
 
 /* Sizes and offsets, taken from the ABI declarations above. */
@@ -757,6 +885,7 @@ const DESC_SIZE: usize = size_of::<SideEventDescription>();
 const FIELD_SIZE: usize = size_of::<SideEventField>();
 const TYPE_SIZE: usize = size_of::<SideType>();
 const STRUCT_TYPE_SIZE: usize = size_of::<SideTypeStruct>();
+const ATTR_SIZE: usize = size_of::<SideAttr>();
 
 const O_DESC_STRUCT_SIZE: usize = offset_of!(SideEventDescription, struct_size);
 const O_DESC_VERSION: usize = offset_of!(SideEventDescription, version);
@@ -769,6 +898,22 @@ const O_DESC_NR_ATTR: usize = offset_of!(SideEventDescription, nr_side_attr_type
 const O_DESC_LOGLEVEL: usize = offset_of!(SideEventDescription, loglevel);
 
 const O_ARRAY_LENGTH: usize = offset_of!(SideRelArray, length);
+const O_SEL_ARRAY_LENGTH: usize = offset_of!(SideSelArray, length);
+const O_DESC_ATTRIBUTES: usize = offset_of!(SideEventDescription, attributes);
+
+const O_ATTR_KEY: usize = offset_of!(SideAttr, key);
+const O_ATTR_VALUE: usize = offset_of!(SideAttr, value);
+const O_RAWSTR_P: usize = offset_of!(SideTypeRawString, p);
+const O_RAWSTR_UNIT_SIZE: usize = offset_of!(SideTypeRawString, unit_size);
+const O_RAWSTR_BYTE_ORDER: usize = offset_of!(SideTypeRawString, byte_order);
+const O_ATTRVAL_TYPE: usize = offset_of!(SideAttrValue, type_);
+const O_ATTRVAL_U: usize = offset_of!(SideAttrValue, u);
+
+const O_BOOL_ATTRIBUTES: usize = offset_of!(SideTypeBool, attributes);
+const O_INT_ATTRIBUTES: usize = offset_of!(SideTypeInteger, attributes);
+const O_STR_ATTRIBUTES: usize = offset_of!(SideTypeString, attributes);
+const O_ARRAY_ATTRIBUTES: usize = offset_of!(SideTypeArray, attributes);
+const O_VLA_ATTRIBUTES: usize = offset_of!(SideTypeVla, attributes);
 const O_SEL_IS_OFFSET: usize = offset_of!(SideSelPtr, is_offset);
 
 const O_FIELD_NAME: usize = offset_of!(SideEventField, field_name);
@@ -920,6 +1065,7 @@ pub struct EventSpec {
     pub loglevel: u32,
     pub flags: u64,
     pub fields: &'static [Field],
+    pub attributes: &'static [Attr],
 }
 
 /*
@@ -1012,12 +1158,61 @@ const fn fields_eq(a: &[Field], b: &[Field]) -> bool {
     }
     let mut i = 0;
     while i < a.len() {
-        if !str_eq(a[i].name, b[i].name) || !layout_eq(&a[i].layout, &b[i].layout) {
+        if !str_eq(a[i].name, b[i].name)
+            || !layout_eq(&a[i].layout, &b[i].layout)
+            || !attrs_eq(a[i].attributes, b[i].attributes)
+        {
             return false;
         }
         i += 1;
     }
     true
+}
+
+const fn attrs_eq(a: &[Attr], b: &[Attr]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !str_eq(a[i].key, b[i].key) || !attr_value_eq(&a[i].value, &b[i].value) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn attr_value_eq(a: &AttrValue, b: &AttrValue) -> bool {
+    match (*a, *b) {
+        (AttrValue::Null, AttrValue::Null) => true,
+        (AttrValue::Bool(x), AttrValue::Bool(y)) => x == y,
+        (AttrValue::U8(x), AttrValue::U8(y)) => x == y,
+        (AttrValue::U16(x), AttrValue::U16(y)) => x == y,
+        (AttrValue::U32(x), AttrValue::U32(y)) => x == y,
+        (AttrValue::U64(x), AttrValue::U64(y)) => x == y,
+        (AttrValue::S8(x), AttrValue::S8(y)) => x == y,
+        (AttrValue::S16(x), AttrValue::S16(y)) => x == y,
+        (AttrValue::S32(x), AttrValue::S32(y)) => x == y,
+        (AttrValue::S64(x), AttrValue::S64(y)) => x == y,
+        (AttrValue::String(x), AttrValue::String(y)) => str_eq(x, y),
+        _ => false,
+    }
+}
+
+/// How many bytes an attribute list occupies: the array, the key of
+/// each attribute, and any string one holds as its value.
+const fn attrs_size(attrs: &[Attr]) -> usize {
+    let mut size = attrs.len() * ATTR_SIZE;
+    let mut i = 0;
+    while i < attrs.len() {
+        size += attrs[i].key.len() + 1;
+        if let AttrValue::String(value) = attrs[i].value {
+            size += value.len() + 1;
+        }
+        i += 1;
+    }
+    size
 }
 
 const fn layout_eq(a: &Layout, b: &Layout) -> bool {
@@ -1117,6 +1312,7 @@ const fn fields_size(fields: &'static [Field], shared: &mut Shared) -> usize {
     let mut i = 0;
     while i < fields.len() {
         size += fields[i].name.len() + 1;
+        size += attrs_size(fields[i].attributes);
         size += layout_size(&fields[i].layout, shared);
         i += 1;
     }
@@ -1152,6 +1348,7 @@ pub const fn group_size(events: &[EventSpec]) -> usize {
     while i < events.len() {
         size += events[i].provider.len() + 1;
         size += events[i].event.len() + 1;
+        size += attrs_size(events[i].attributes);
         size += fields_size(events[i].fields, &mut shared);
         i += 1;
     }
@@ -1164,6 +1361,100 @@ pub const fn group_size(events: &[EventSpec]) -> usize {
 /// what a state needs to reach the one it belongs to.
 pub const fn event_offset(index: usize) -> usize {
     index * DESC_SIZE
+}
+
+/// Lay out an attribute list at `pos` and point `at` at it, which is a
+/// distance where the member holds one and a distance with the selector
+/// byte set where it holds either. Nothing is written for an empty
+/// list: the zeroed bytes it starts as are one.
+const fn put_attrs(
+    buf: &mut [u8],
+    pos: usize,
+    at: usize,
+    selector: bool,
+    attrs: &[Attr],
+) -> usize {
+    if attrs.is_empty() {
+        return pos;
+    }
+
+    let array = pos;
+    let mut pos = pos + attrs.len() * ATTR_SIZE;
+    let mut i = 0;
+
+    while i < attrs.len() {
+        let attr = array + i * ATTR_SIZE;
+        let key = attr + O_ATTR_KEY;
+        let value = attr + O_ATTR_VALUE;
+
+        let (at_key, next) = put_str(buf, pos, attrs[i].key);
+        pos = next;
+        put_raw_string(buf, key, at_key);
+
+        match attrs[i].value {
+            AttrValue::Null => put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_NULL),
+            AttrValue::Bool(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_BOOL);
+                put_u8(buf, value + O_ATTRVAL_U, v as u8);
+            }
+            AttrValue::U8(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_U8);
+                put_u8(buf, value + O_ATTRVAL_U, v);
+            }
+            AttrValue::U16(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_U16);
+                put_u16(buf, value + O_ATTRVAL_U, v);
+            }
+            AttrValue::U32(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_U32);
+                put_u32(buf, value + O_ATTRVAL_U, v);
+            }
+            AttrValue::U64(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_U64);
+                put_u64(buf, value + O_ATTRVAL_U, v);
+            }
+            AttrValue::S8(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_S8);
+                put_u8(buf, value + O_ATTRVAL_U, v as u8);
+            }
+            AttrValue::S16(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_S16);
+                put_u16(buf, value + O_ATTRVAL_U, v as u16);
+            }
+            AttrValue::S32(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_S32);
+                put_u32(buf, value + O_ATTRVAL_U, v as u32);
+            }
+            AttrValue::S64(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_S64);
+                put_u64(buf, value + O_ATTRVAL_U, v as u64);
+            }
+            AttrValue::String(v) => {
+                put_u32(buf, value + O_ATTRVAL_TYPE, SIDE_ATTR_TYPE_STRING);
+                let (at_value, next) = put_str(buf, pos, v);
+                pos = next;
+                put_raw_string(buf, value + O_ATTRVAL_U, at_value);
+            }
+        }
+        i += 1;
+    }
+
+    if selector {
+        put_sel_rel(buf, at, array);
+        put_u32(buf, at + O_SEL_ARRAY_LENGTH, attrs.len() as u32);
+    } else {
+        put_rel(buf, at, array);
+        put_u32(buf, at + O_ARRAY_LENGTH, attrs.len() as u32);
+    }
+    pos
+}
+
+/// A `struct side_type_raw_string` at `at`, holding the string at
+/// `target`. Both a key and a string value are one.
+const fn put_raw_string(buf: &mut [u8], at: usize, target: usize) {
+    put_sel_rel(buf, at + O_RAWSTR_P, target);
+    put_u8(buf, at + O_RAWSTR_UNIT_SIZE, size_of::<u8>() as u8);
+    put_u8(buf, at + O_RAWSTR_BYTE_ORDER, SIDE_TYPE_BYTE_ORDER_HOST);
 }
 
 /// Lay out a field array at `pos`, and return where it starts and where
@@ -1183,7 +1474,15 @@ const fn put_fields<const K: usize>(
         let (name, next) = put_str(buf, pos, fields[i].name);
         pos = next;
         put_rel(buf, field + O_FIELD_NAME, name);
-        pos = put_type(buf, pos, field + O_FIELD_TYPE, &fields[i].layout, shared, patches);
+        pos = put_type(
+            buf,
+            pos,
+            field + O_FIELD_TYPE,
+            &fields[i].layout,
+            fields[i].attributes,
+            shared,
+            patches,
+        );
         i += 1;
     }
     (array, pos)
@@ -1196,6 +1495,7 @@ const fn put_type<const K: usize>(
     pos: usize,
     at: usize,
     layout: &Layout,
+    attributes: &'static [Attr],
     shared: &mut Shared,
     patches: &mut Patches<K>,
 ) -> usize {
@@ -1206,19 +1506,23 @@ const fn put_type<const K: usize>(
         Layout::Bool => {
             put_u16(buf, at, SIDE_TYPE_BOOL);
             put_bool_body(buf, u, size_of::<u8>() as u16);
+            pos = put_attrs(buf, pos, u + O_BOOL_ATTRIBUTES, true, attributes);
         }
         Layout::Integer { size, signed } => {
             put_u16(buf, at, stack_integer_label(size, signed));
             put_integer_body(buf, u, size, signed);
+            pos = put_attrs(buf, pos, u + O_INT_ATTRIBUTES, true, attributes);
         }
         Layout::Pointer => {
             put_u16(buf, at, SIDE_TYPE_POINTER);
             put_integer_body(buf, u, size_of::<usize>() as u16, false);
+            pos = put_attrs(buf, pos, u + O_INT_ATTRIBUTES, true, attributes);
         }
         Layout::String => {
             put_u16(buf, at, SIDE_TYPE_STRING_UTF8);
             put_u8(buf, u + O_STR_UNIT_SIZE, size_of::<u8>() as u8);
             put_u8(buf, u + O_STR_BYTE_ORDER, SIDE_TYPE_BYTE_ORDER_HOST);
+            pos = put_attrs(buf, pos, u + O_STR_ATTRIBUTES, true, attributes);
         }
         Layout::GatherBool { offset, size } => {
             put_u16(buf, at, SIDE_TYPE_GATHER_BOOL);
@@ -1226,6 +1530,7 @@ const fn put_type<const K: usize>(
             put_u16(buf, u + O_GBOOL_OFFSET_BITS, 0);
             put_u8(buf, u + O_GBOOL_ACCESS, SIDE_TYPE_GATHER_ACCESS_DIRECT);
             put_bool_body(buf, u + O_GBOOL_TYPE, size);
+            pos = put_attrs(buf, pos, u + O_GBOOL_TYPE + O_BOOL_ATTRIBUTES, true, attributes);
         }
         Layout::GatherInteger {
             offset,
@@ -1237,6 +1542,7 @@ const fn put_type<const K: usize>(
             put_u16(buf, u + O_GINT_OFFSET_BITS, 0);
             put_u8(buf, u + O_GINT_ACCESS, SIDE_TYPE_GATHER_ACCESS_DIRECT);
             put_integer_body(buf, u + O_GINT_TYPE, size, signed);
+            pos = put_attrs(buf, pos, u + O_GINT_TYPE + O_INT_ATTRIBUTES, true, attributes);
         }
         Layout::GatherPointer { offset } => {
             put_u16(buf, at, SIDE_TYPE_GATHER_POINTER);
@@ -1244,6 +1550,7 @@ const fn put_type<const K: usize>(
             put_u16(buf, u + O_GINT_OFFSET_BITS, 0);
             put_u8(buf, u + O_GINT_ACCESS, SIDE_TYPE_GATHER_ACCESS_DIRECT);
             put_integer_body(buf, u + O_GINT_TYPE, size_of::<usize>() as u16, false);
+            pos = put_attrs(buf, pos, u + O_GINT_TYPE + O_INT_ATTRIBUTES, true, attributes);
         }
         Layout::GatherStruct {
             offset,
@@ -1251,6 +1558,14 @@ const fn put_type<const K: usize>(
             access,
             fields,
         } => {
+            /*
+             * A structure keeps its attributes with its definition, as
+             * it does in C: side_field_gather_struct() takes none.
+             */
+            assert!(
+                attributes.is_empty(),
+                "side: the attributes of a structure belong to the structure itself"
+            );
             put_u16(buf, at, SIDE_TYPE_GATHER_STRUCT);
             put_u64(buf, u + O_GSTRUCT_OFFSET, offset);
             put_u8(buf, u + O_GSTRUCT_ACCESS, access);
@@ -1288,11 +1603,12 @@ const fn put_type<const K: usize>(
 
             let array = u + O_GARRAY_TYPE;
             put_u32(buf, array + O_ARRAY_TYPE_LENGTH, length);
+            pos = put_attrs(buf, pos, array + O_ARRAY_ATTRIBUTES, false, attributes);
 
             let elem_type = pos;
             pos += TYPE_SIZE;
             put_rel(buf, array + O_ARRAY_ELEM_TYPE, elem_type);
-            pos = put_type(buf, pos, elem_type, elem, shared, patches);
+            pos = put_type(buf, pos, elem_type, elem, &[], shared, patches);
         }
         Layout::GatherVla {
             offset,
@@ -1305,6 +1621,8 @@ const fn put_type<const K: usize>(
             put_u8(buf, u + O_GVLA_ACCESS, SIDE_TYPE_GATHER_ACCESS_POINTER);
 
             let vla = u + O_GVLA_TYPE;
+            pos = put_attrs(buf, pos, vla + O_VLA_ATTRIBUTES, false, attributes);
+
             let elem_type = pos;
             pos += TYPE_SIZE;
             let length_type = pos;
@@ -1312,7 +1630,7 @@ const fn put_type<const K: usize>(
             put_rel(buf, vla + O_VLA_ELEM_TYPE, elem_type);
             put_rel(buf, vla + O_VLA_LENGTH_TYPE, length_type);
 
-            pos = put_type(buf, pos, elem_type, elem, shared, patches);
+            pos = put_type(buf, pos, elem_type, elem, &[], shared, patches);
             /* The length is read from the vector itself. */
             pos = put_type(
                 buf,
@@ -1323,6 +1641,7 @@ const fn put_type<const K: usize>(
                     size: size_of::<usize>() as u16,
                     signed: false,
                 },
+                &[],
                 shared,
                 patches,
             );
@@ -1333,6 +1652,14 @@ const fn put_type<const K: usize>(
             access,
             target,
         } => {
+            /*
+             * A structure keeps its attributes with its definition, as
+             * it does in C: side_field_gather_struct() takes none.
+             */
+            assert!(
+                attributes.is_empty(),
+                "side: the attributes of a structure belong to the structure itself"
+            );
             put_u16(buf, at, SIDE_TYPE_GATHER_STRUCT);
             put_u64(buf, u + O_GSTRUCT_OFFSET, offset);
             put_u8(buf, u + O_GSTRUCT_ACCESS, access);
@@ -1398,13 +1725,13 @@ pub const fn build_group<const N: usize, const K: usize>(events: &[EventSpec]) -
         );
 
         /*
-         * The event has no attribute, and neither has any of its types.
-         * Their arrays are left as the zeroed bytes they start as: a
-         * length of zero, which is what a reader looks at before the
-         * pointer, and a pointer which is a distance of zero where the
-         * member holds one and a null address where it holds either.
-         * Nothing follows it.
+         * An empty attribute list is left as the zeroed bytes it starts
+         * as: a length of zero, which is what a reader looks at before
+         * the pointer, and a pointer which is a distance of zero where
+         * the member holds one and a null address where it holds
+         * either. Nothing follows it.
          */
+        pos = put_attrs(&mut buf, pos, desc + O_DESC_ATTRIBUTES, false, event.attributes);
         e += 1;
     }
 
@@ -1614,6 +1941,10 @@ const _: [(); 32] = [(); size_of::<SideArgStatic>()];
 const _: [(); 60] = [(); size_of::<SideArgPayload>()];
 const _: [(); 64] = [(); size_of::<SideArg>()];
 const _: [(); 20] = [(); size_of::<SideArgVec>()];
+const _: [(); 19] = [(); size_of::<SideTypeRawString>()];
+const _: [(); 32] = [(); size_of::<SideAttrValuePayload>()];
+const _: [(); 36] = [(); size_of::<SideAttrValue>()];
+const _: [(); 55] = [(); size_of::<SideAttr>()];
 const _: [(); 21] = [(); size_of::<SideTypeNull>()];
 const _: [(); 26] = [(); size_of::<SideTypeBool>()];
 const _: [(); 21] = [(); size_of::<SideTypeByte>()];
@@ -1739,33 +2070,15 @@ macro_rules! __emit_event_call_macro {
 #[macro_export]
 macro_rules! define_event {
     (
-        $name:ident !,
-        provider: $provider:literal,
-        event: $event:literal,
-        level: $level:expr,
-        fields: (
-            $( $arg:ident : $ty:ty ),* $(,)?
-        ) $(,)?
-    ) => {
-        $crate::define_event!(
-            $name,
-            provider: $provider,
-            event: $event,
-            level: $level,
-            fields: (
-                $( $arg : $ty ),*
-            ),
-        );
-    };
-
-    (
         $name:ident,
         provider: $provider:literal,
         event: $event:literal,
         level: $level:expr,
         fields: (
-            $( $arg:ident : $ty:ty ),* $(,)?
-        ) $(,)?
+            $( $arg:ident : $ty:ty $( [ $( $fattr:expr ),* $(,)? ] )? ),* $(,)?
+        )
+        $(, attributes: [ $( $eattr:expr ),* $(,)? ] )?
+        $(,)?
     ) => {
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -1787,6 +2100,7 @@ macro_rules! define_event {
                     $crate::side::Field {
                         name: ::core::stringify!($arg),
                         layout: <$ty as $crate::side::FieldType>::LAYOUT,
+                        attributes: &[ $( $( $fattr ),* )? ],
                     }
                 ),*
             ];
@@ -1798,6 +2112,7 @@ macro_rules! define_event {
                 loglevel: $level,
                 flags: 0,
                 fields: EVENT_FIELDS,
+                attributes: &[ $( $( $eattr ),* )? ],
             }];
 
             const EVENT_DESC_SIZE: usize = $crate::side::group_size(EVENT_SPECS);

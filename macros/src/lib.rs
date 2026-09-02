@@ -60,7 +60,7 @@ fn derive_side_gather_impl(input: TokenStream) -> Result<String, String> {
         let offset = format!("::core::mem::offset_of!({layout_struct}, {field_name}) as u64");
         let layout = member_layout(layout_struct, field_name, &member_type, &offset)?;
         layouts.push_str(&format!(
-            "::libside::side::Field {{ name: ::core::stringify!({field_name}), layout: {layout} }},"
+            "::libside::side::Field {{ name: ::core::stringify!({field_name}), layout: {layout}, attributes: &[] }},"
         ));
 
         let assertion_type = field_type.replace("& ' ", "&'");
@@ -298,12 +298,20 @@ enum FieldKind {
     Extern(String),
 }
 
+struct EventField {
+    name: String,
+    kind: FieldKind,
+    /// The attributes of the field's type, as they were written.
+    attributes: String,
+}
+
 struct Event {
     name: String,
     provider: String,
     event: String,
     level: String,
-    fields: Vec<(String, FieldKind)>,
+    fields: Vec<EventField>,
+    attributes: String,
 }
 
 fn events_impl(item: TokenStream) -> Result<String, String> {
@@ -385,6 +393,7 @@ fn parse_event(stream: TokenStream) -> Result<Event, String> {
         event: String::new(),
         level: String::new(),
         fields: Vec::new(),
+        attributes: String::new(),
     };
 
     for part in parts {
@@ -405,6 +414,12 @@ fn parse_event(stream: TokenStream) -> Result<Event, String> {
             "provider" => event.provider = value,
             "event" => event.event = value,
             "level" => event.level = value,
+            "attributes" => {
+                let TokenTree::Group(group) = &part[colon + 1] else {
+                    return Err("side: the attributes of an event go in brackets".into());
+                };
+                event.attributes = group.stream().to_string();
+            }
             "fields" => {
                 let TokenTree::Group(group) = &part[colon + 1] else {
                     return Err("side: the fields of an event go in brackets".into());
@@ -422,9 +437,12 @@ fn parse_event(stream: TokenStream) -> Result<Event, String> {
                     let TokenTree::Ident(name) = &field[colon - 1] else {
                         return Err("side: an event field is written `name: type'".into());
                     };
-                    event
-                        .fields
-                        .push((name.to_string(), parse_field_kind(&field[colon + 1..])?));
+                    let (kind, attributes) = parse_field(&field[colon + 1..])?;
+                    event.fields.push(EventField {
+                        name: name.to_string(),
+                        kind,
+                        attributes,
+                    });
                 }
             }
             other => return Err(format!("side: unknown key `{other}' in define_event!")),
@@ -435,6 +453,27 @@ fn parse_event(stream: TokenStream) -> Result<Event, String> {
         return Err("side: an event needs a provider, an event name and a level".into());
     }
     Ok(event)
+}
+
+/// A field is its type and, where it has them, the attributes which
+/// follow it in brackets.
+///
+/// A bracket group at the end is that list, unless it is the whole of
+/// what was written, which makes it an array type instead. An event
+/// field cannot be an array -- FieldType is not implemented for one --
+/// so nothing is lost by reading it that way round.
+fn parse_field(tokens: &[TokenTree]) -> Result<(FieldKind, String), String> {
+    if tokens.len() > 1 {
+        if let Some(TokenTree::Group(group)) = tokens.last() {
+            if group.delimiter() == Delimiter::Bracket {
+                return Ok((
+                    parse_field_kind(&tokens[..tokens.len() - 1])?,
+                    group.stream().to_string(),
+                ));
+            }
+        }
+    }
+    Ok((parse_field_kind(tokens)?, String::new()))
 }
 
 /// `side_extern(PATH)' names a structure described elsewhere; anything
@@ -471,8 +510,8 @@ fn group_body(events: &[Event]) -> String {
     /* Each structure described elsewhere, in order of first mention. */
     let mut targets: Vec<String> = Vec::new();
     for event in events {
-        for (_, kind) in &event.fields {
-            if let FieldKind::Extern(path) = kind {
+        for field in &event.fields {
+            if let FieldKind::Extern(path) = &field.kind {
                 if !targets.iter().any(|known| known == path) {
                     targets.push(path.clone());
                 }
@@ -490,7 +529,8 @@ fn group_body(events: &[Event]) -> String {
         let fields = event
             .fields
             .iter()
-            .map(|(name, kind)| {
+            .map(|field| {
+                let (name, kind) = (&field.name, &field.kind);
                 let layout = match kind {
                     FieldKind::Rust(type_) => {
                         format!("<{type_} as ::libside::side::FieldType>::LAYOUT")
@@ -502,15 +542,18 @@ fn group_body(events: &[Event]) -> String {
                         )
                     }
                 };
-                format!("::libside::side::Field {{ name: \"{name}\", layout: {layout} }},")
+                format!(
+                    "::libside::side::Field {{ name: \"{name}\", layout: {layout}, attributes: &[{}] }},",
+                    field.attributes
+                )
             })
             .collect::<String>();
         field_lists.push_str(&format!(
             "const FIELDS_{i}: &[::libside::side::Field] = &[{fields}];"
         ));
         specs.push_str(&format!(
-            "::libside::side::EventSpec {{ provider: {}, event: {}, loglevel: {}, flags: 0, fields: FIELDS_{i} }},",
-            event.provider, event.event, event.level
+            "::libside::side::EventSpec {{ provider: {}, event: {}, loglevel: {}, flags: 0, fields: FIELDS_{i}, attributes: &[{}] }},",
+            event.provider, event.event, event.level, event.attributes
         ));
 
         states.push_str(&format!(
@@ -540,7 +583,7 @@ fn group_body(events: &[Event]) -> String {
         let arguments = event
             .fields
             .iter()
-            .map(|(name, kind)| (name.clone(), argument_type(kind)))
+            .map(|field| (field.name.clone(), argument_type(&field.kind)))
             .collect::<Vec<_>>();
         let signature = arguments
             .iter()
@@ -609,7 +652,7 @@ fn group_body(events: &[Event]) -> String {
     let ntargets_refs = events
         .iter()
         .flat_map(|event| &event.fields)
-        .filter(|(_, kind)| matches!(kind, FieldKind::Extern(_)))
+        .filter(|field| matches!(field.kind, FieldKind::Extern(_)))
         .count();
     let target_table = targets
         .iter()
