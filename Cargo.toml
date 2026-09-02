@@ -1,0 +1,16 @@
+[package]
+name = "libside-rust"
+version = "0.1.0"
+edition = "2021"
+links = "side"
+build = "build.rs"
+
+[lib]
+name = "libside"
+path = "src/lib.rs"
+
+[dependencies]
+libside-rust-macros = { path = "macros" }
+
+[build-dependencies]
+pkg-config = "0.3"
