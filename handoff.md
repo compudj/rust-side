@@ -9,11 +9,11 @@ moved.
 
     libside      f3aee21    Tell a tracer when a statedump has been taken
     lttng-ust    c848464d   Answer for the statedump this session asked for
-    lttng-tools  f92f1ad28  sessiond: Take the notification
+    lttng-tools  28fee7399  Wait for a state dump from the client
     rust-side    50c2954    Dump the state a tracer which started late has no
 
 NOTHING IS UNCOMMITTED anywhere. Unpushed as of the last check:
-libside 2, lttng-ust 4, lttng-tools 1, rust-side 0. Check with
+libside 2, lttng-ust 4, lttng-tools 2, rust-side 1. Check with
 `git rev-list --count @{u}..HEAD` rather than trusting this line.
 
 Build everything with
@@ -115,49 +115,69 @@ replies; NO POLICY, deliberately.
     query after start   outstanding = true
     query after stop    outstanding = false (after the fix above)
 
-# NEXT: ask from the client, do not block in the daemon
+# DONE: --wait, from the client
 
-DECIDED THIS SESSION, replacing an earlier idea. The daemon does NOT
-wait. `lttng start` and `lttng regenerate statedump` return
-immediately, as today, and the CLI gets a way to ask whether the
-statedump is complete, so waiting -- and any timeout -- is the user's.
+`lttng start --wait` and `lttng regenerate statedump --wait`, with
+`--timeout=SECONDS` defaulting to 2. lttng-tools `28fee7399`.
 
-WHY NOT A BOUNDED WAIT IN THE SESSIOND, which was tried and backed out:
-both `cmd_start_trace()` and `cmd_regenerate_statedump()` run with the
-per-session lock held AND with the global session list lock held --
-client.cpp takes the list lock across _all_ session commands and says
-so at the declaration of `list_lock`. Sleeping there stalls every
-session in the daemon, not just this one. Sleeping under the RCU read
-lock which the orchestrator loops hold is a second, separate hazard: it
-holds off grace periods for the whole wait, including for the thread
-which receives the very notifications being waited on.
+THE DAEMON DOES NOT WAIT, and cannot: both `cmd_start_trace()` and
+`cmd_regenerate_statedump()` run with the per-session lock held AND
+with the global session list lock held -- client.cpp takes the list
+lock across every session command and says so where `list_lock` is
+declared -- so sleeping there stalls every session in the daemon.
+Sleeping under the RCU read lock the orchestrator loops hold is a
+second hazard: it holds off grace periods for the whole wait, including
+for the thread which receives the application notifications. A bounded
+wait inside the orchestrator was written and backed out for exactly
+this.
 
-THE STACK TO BUILD:
+The stack, all of it now in place:
 
-    lttng CLI  ->  liblttng-ctl  ->  new sessiond client command
-               ->  domain orchestrator  ->  per app,
-                   lttng_ust_ctl_statedump_outstanding()
+    lttng --wait  ->  wait_for_statedump() in src/bin/lttng/utils.cpp
+                  ->  lttng_statedump_outstanding()
+                  ->  LTTCOMM_SESSIOND_COMMAND_STATEDUMP_OUTSTANDING
+                  ->  domain_orchestrator::is_statedump_outstanding()
+                  ->  per app, lttng_ust_ctl_statedump_outstanding()
 
-The bottom of it is already proven: a temporary probe in
-`_start_app_trace` / `_stop_app_trace` produced the query results in
-the table above, then was reverted. The only piece of it kept back is a
-ten-line `protocol_guard::is_statedump_outstanding(handle)` wrapper in
-`ust-app-command-socket{.hpp,-protocol.cpp}`, which was written,
-exercised, and then reverted with the probe -- rewrite it, it is
-trivial.
+`wait_for_statedump()` polls every 50 ms until the deadline. The kernel
+orchestrator always answers "not outstanding": the kernel state dump is
+taken before its command returns.
 
-OPEN, and the reason this stopped here: the CLI surface is unchosen.
-A subcommand of its own, something folded into `lttng status`, or a
-`--wait`/`--timeout` on the client side of `regenerate statedump`. The
-public liblttng-ctl API name and its entry in `lttng-ctl.map` are the
-same question, and both are one-way doors.
+EXPIRY IS NOT AN ERROR, and this matters: an application which dumps by
+polling routinely will not have polled within two seconds. `lttng`
+warns, exits CMD_WARNING (status 4), and tracing is started either way.
+`lttng start --wait` must never make such an application unstartable.
+`regenerate metadata --wait` is refused rather than ignored.
 
-STILL TRUE, and worth keeping in the eventual commit message: the query
-is per application, so the daemon aggregates -- one application which
-polls rarely must not hold up "the session is done". And never use any
-of this to extend the constructor semaphore: in polling mode the
-application cannot reach `run_pending_statedumps()` until main() runs,
-so waiting there is a guaranteed deadlock.
+MEASURED, with the C test application in the scratchpad:
+
+    agent thread        start --wait            0.07 s, success
+    polling every 6 s   start --wait            gave up at 2.10 s, warned
+    polling every 6 s   regenerate --wait -t15  1.80 s, success
+    no applications     regenerate --wait       immediate, success
+
+# NEXT: nothing chosen
+
+The statedump work is complete across the four trees. Loose ends, none
+urgent:
+
+- **The push notification has no consumer which needs it yet.** The
+  session daemon takes it and logs it (`f92f1ad28`); `--wait` polls the
+  query instead, because a client-side wait cannot be woken by a
+  notification the daemon received. It is what a daemon-side waiter
+  would use, if one is ever wanted somewhere it can sleep.
+- **`tests/regression/tools/regen-statedump/test_ust` fails its last
+  three assertions** (0 events found) IN THIS ENVIRONMENT -- verified
+  by control to fail identically on the tree WITHOUT any of this work,
+  so it is not a regression. Its first nine assertions pass, including
+  the regeneration itself, and the same scenario driven by hand
+  produces exactly the 4 events it looks for. Something about the test
+  harness under the staged build; not chased.
+- **No test covers `--wait`.** The obvious one is a polling application
+  which does not poll, asserting the warning and the non-zero status.
+- **`abi_ref/`** in src/lib/lttng-ctl was not touched;
+  `lttng_statedump_outstanding()` is a symbol addition, which is
+  compatible, but check whether that directory wants regenerating.
 
 # DONE in earlier sessions
 
@@ -368,6 +388,8 @@ memory.
     query, the completion notification, and scoping the query to the
     session's own request.
 16. lttng-tools: the session daemon takes the notification.
+17. lttng-tools: `--wait` on `lttng start` and `lttng regenerate
+    statedump`, with a client-side timeout.
 
 # Other ideas, none started
 
